@@ -1,0 +1,19 @@
+{
+  "log_dir": "logs",
+  "log_pattern": "{task}_{date}-{time}.log",
+  "tasks": [
+    {
+      "name": "nightly-report",
+      "max_age_hours": 30,
+      "sentinel": "NIGHTLY_REPORT_OK",
+      "failure_sentinel": "NIGHTLY_REPORT_FAILED",
+      "manual": false
+    },
+    {
+      "name": "weekly-audit",
+      "max_age_hours": 192,
+      "sentinel": "WEEKLY_AUDIT_OK",
+      "manual": true
+    }
+  ]
+}
