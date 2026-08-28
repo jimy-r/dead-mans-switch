@@ -13,8 +13,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      # Pinned so a ruff release can't silently change what gets linted.
-      - run: pip install ruff==0.15.21
+      - run: pip install -r .github/requirements-ci.txt
       - run: ruff check .
       - run: ruff format --check .
 

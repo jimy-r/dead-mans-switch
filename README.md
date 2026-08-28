@@ -87,7 +87,7 @@ python deadmans.py selftest
 
 ## Origin
 
-This is pattern 3, ["Make silent failure loud (the dead-man's switch)"](https://github.com/jimy-r/agent-workspace-architecture/blob/main/PATTERNS.md#3-make-silent-failure-loud-the-dead-mans-switch), from the [agent-workspace-architecture](https://github.com/jimy-r/agent-workspace-architecture) reference, extracted into a standalone tool.
+This is pattern 3, ["Make silent failure loud (the dead-man's switch)"](https://github.com/jimy-r/agent-workspace-architecture/blob/main/PATTERNS.md?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch#3-make-silent-failure-loud-the-dead-mans-switch), from the [agent-workspace-architecture](https://github.com/jimy-r/agent-workspace-architecture?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch) reference, extracted into a standalone tool. It's one of six repos published from that same workspace; the [interactive tour](https://jimy-r.github.io/agent-workspace-architecture/?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch) walks the rest.
 
 ## License
 
