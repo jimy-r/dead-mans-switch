@@ -3,3 +3,11 @@ __pycache__/
 .ruff_cache/
 logs/
 *.log
+
+# secret-file patterns (defence-in-depth; credentials live in Bitwarden, never here)
+.env
+.env.*
+*.key
+*.pem
+*credentials*
+*secrets*
