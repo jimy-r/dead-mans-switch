@@ -1,3 +1,3 @@
 # CI toolchain pin. Pinned so a ruff release can't silently change what gets
 # linted. Dependabot watches this file so bumps arrive as PRs.
-ruff==0.15.21
+ruff==0.16.4
