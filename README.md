@@ -23,8 +23,16 @@ The exit code inverts what you would expect from a linter. 0 means every tracked
 
 ## Install
 
+Install from source until v0.2.0 lands on PyPI:
+
 ```bash
-pip install dead-mans-switch
+git clone https://github.com/jimy-r/dead-mans-switch.git
+cd dead-mans-switch
+pip install .
+```
+
+```bash
+pip install dead-mans-switch  # after the first PyPI release
 ```
 
 This adds a `dead-mans-switch` command to your PATH. Every example below also works as `dead-mans-switch check` in place of `python deadmans.py check`.
