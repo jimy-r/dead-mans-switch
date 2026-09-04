@@ -21,6 +21,24 @@ Each job you track writes a plain success string (a sentinel) into its own log f
 
 The exit code inverts what you would expect from a linter. 0 means every tracked task is fresh. 1 means at least one needs attention. That makes `deadmans.py check` a one-line addition to a cron job or a CI pipeline.
 
+## Install
+
+Install from source until v0.2.0 lands on PyPI:
+
+```bash
+git clone https://github.com/jimy-r/dead-mans-switch.git
+cd dead-mans-switch
+pip install .
+```
+
+```bash
+pip install dead-mans-switch  # after the first PyPI release
+```
+
+This adds a `dead-mans-switch` command to your PATH. Every example below also works as `dead-mans-switch check` in place of `python deadmans.py check`.
+
+Installing is not required. `deadmans.py` is a single stdlib-only file, so cloning the repo and running `python deadmans.py` works exactly the same, with nothing to add to a scheduling environment beyond the file itself.
+
 ## Quickstart
 
 ```bash
