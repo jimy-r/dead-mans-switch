@@ -218,11 +218,132 @@ class TestLoadConfig(TempDirCase):
             config.tasks["nightly-report"].failure_sentinel, "NIGHTLY_REPORT_FAILED"
         )
 
+    def test_timezone_defaults_to_local(self) -> None:
+        path = self.write_config({"tasks": [self.minimal_task()]})
+        config = deadmans.load_config(path)
+        self.assertEqual(
+            config.tzinfo.utcoffset(None), deadmans.local_timezone().utcoffset(None)
+        )
+
+    def test_timezone_key_is_honoured(self) -> None:
+        path = self.write_config({"timezone": "UTC", "tasks": [self.minimal_task()]})
+        self.assertEqual(
+            deadmans.load_config(path).tzinfo.utcoffset(None), dt.timedelta(0)
+        )
+
+    def test_unknown_timezone_raises(self) -> None:
+        path = self.write_config(
+            {"timezone": "Not/AZone", "tasks": [self.minimal_task()]}
+        )
+        with self.assertRaises(deadmans.ConfigError):
+            deadmans.load_config(path)
+
+    def test_non_string_timezone_raises(self) -> None:
+        path = self.write_config({"timezone": 10, "tasks": [self.minimal_task()]})
+        with self.assertRaises(deadmans.ConfigError):
+            deadmans.load_config(path)
+
     def test_example_config_file_loads_cleanly(self) -> None:
         # deadmans.example.json ships in the repo root, next to this test.
         example = Path(__file__).resolve().parent / "deadmans.example.json"
         config = deadmans.load_config(example)
         self.assertEqual(set(config.tasks), {"nightly-report", "weekly-audit"})
+
+
+class TestResolveTimezone(unittest.TestCase):
+    def test_none_and_local_give_the_host_offset(self) -> None:
+        expected = deadmans.local_timezone().utcoffset(None)
+        for spec in (None, "local", "LOCAL", "  "):
+            with self.subTest(spec=spec):
+                self.assertEqual(
+                    deadmans.resolve_timezone(spec).utcoffset(None), expected
+                )
+
+    def test_utc_aliases(self) -> None:
+        for spec in ("UTC", "utc", "Z", "z"):
+            with self.subTest(spec=spec):
+                self.assertEqual(
+                    deadmans.resolve_timezone(spec).utcoffset(None), dt.timedelta(0)
+                )
+
+    def test_fixed_offsets_with_and_without_a_colon(self) -> None:
+        self.assertEqual(
+            deadmans.resolve_timezone("+10:00").utcoffset(None),
+            dt.timedelta(hours=10),
+        )
+        self.assertEqual(
+            deadmans.resolve_timezone("-0530").utcoffset(None),
+            dt.timedelta(hours=-5, minutes=-30),
+        )
+
+    def test_unknown_zone_raises_rather_than_falling_back(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            deadmans.resolve_timezone("Not/AZone")
+
+    def test_out_of_range_offset_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            deadmans.resolve_timezone("+99:00")
+
+
+class TestTimezoneSkew(TempDirCase):
+    """The bug this key exists for: a UTC-stamping producer read from a
+    UTC+10 host used to report every job ten hours fresher than it was."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.task = deadmans.Task(
+            name="scheduled",
+            max_age_hours=6.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel=None,
+            manual=False,
+        )
+
+    def test_utc_stamps_read_as_utc_are_stale(self) -> None:
+        # Log stamped 00:00 UTC; checker's clock is 20:00 on the same day in
+        # UTC+10, i.e. 10:00 UTC. That is 10h of real age against a 6h window.
+        write_log(self.log_dir, "scheduled_2026-01-15-0000.log", "OK_SENTINEL\n")
+        now = dt.datetime(
+            2026, 1, 15, 20, 0, tzinfo=dt.timezone(dt.timedelta(hours=10))
+        )
+        result = deadmans.check_task(
+            self.task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=now,
+            tz=dt.timezone.utc,
+        )
+        self.assertEqual(result.state, "STALE")
+        self.assertAlmostEqual(result.age_hours, 10.0, places=3)
+
+    def test_same_log_read_as_local_hides_the_age(self) -> None:
+        # Identical inputs, tz left at the checker's own clock: the naive
+        # comparison the old code made, and the false FRESH it produced.
+        write_log(self.log_dir, "scheduled_2026-01-15-0000.log", "OK_SENTINEL\n")
+        plus_ten = dt.timezone(dt.timedelta(hours=10))
+        now = dt.datetime(2026, 1, 15, 4, 0, tzinfo=plus_ten)
+        result = deadmans.check_task(
+            self.task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=now,
+            tz=plus_ten,
+        )
+        self.assertEqual(result.state, "FRESH")
+        self.assertAlmostEqual(result.age_hours, 4.0, places=3)
+
+    def test_naive_now_is_read_in_the_configured_zone(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-0000.log", "OK_SENTINEL\n")
+        result = deadmans.check_task(
+            self.task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=dt.datetime(2026, 1, 15, 4, 0),
+            tz=dt.timezone.utc,
+        )
+        self.assertEqual(result.state, "FRESH")
+        self.assertAlmostEqual(result.age_hours, 4.0, places=3)
 
 
 class TestLatestLogAndParseTime(TempDirCase):
@@ -273,8 +394,19 @@ class TestLatestLogAndParseTime(TempDirCase):
     def test_parse_log_time_round_trips(self) -> None:
         log_dir = self.tmp_path / "logs"
         log = write_log(log_dir, "t_2026-03-04-1530.log", "body")
+        parsed = deadmans.parse_log_time(
+            log, "t", deadmans.DEFAULT_LOG_PATTERN, dt.timezone.utc
+        )
+        self.assertEqual(
+            parsed, dt.datetime(2026, 3, 4, 15, 30, tzinfo=dt.timezone.utc)
+        )
+
+    def test_parse_log_time_defaults_to_the_local_zone(self) -> None:
+        log_dir = self.tmp_path / "logs"
+        log = write_log(log_dir, "t_2026-03-04-1530.log", "body")
         parsed = deadmans.parse_log_time(log, "t", deadmans.DEFAULT_LOG_PATTERN)
-        self.assertEqual(parsed, dt.datetime(2026, 3, 4, 15, 30))
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), deadmans.local_timezone().utcoffset(None))
 
     def test_parse_log_time_invalid_date_returns_none(self) -> None:
         log_dir = self.tmp_path / "logs"

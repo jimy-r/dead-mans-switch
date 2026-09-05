@@ -35,10 +35,19 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
+from zoneinfo import ZoneInfo
 
 DEFAULT_CONFIG_PATH = Path("deadmans.json")
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_PATTERN = "{task}_{date}-{time}.log"
+DEFAULT_TIMEZONE = "local"
+
+# A log filename carries no offset, so "2026-01-15-0930" is only meaningful
+# once you say which clock wrote it. Comparing that naive stamp against a
+# naive local now() silently skews every age by the gap between the two --
+# a UTC-stamping producer read from a UTC+10 host reports every job ten
+# hours fresher than it is. Both sides are made aware instead.
+_OFFSET_RE = re.compile(r"^(?P<sign>[+-])(?P<hh>\d{2}):?(?P<mm>\d{2})$")
 
 # States that mean "this task is not a finding". Everything else -- STALE,
 # FAILED, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
@@ -47,6 +56,7 @@ OK_STATES = frozenset({"FRESH", "MANUAL_OK"})
 EXAMPLE_CONFIG: dict[str, Any] = {
     "log_dir": "logs",
     "log_pattern": "{task}_{date}-{time}.log",
+    "timezone": "local",
     "tasks": [
         {
             "name": "nightly-report",
@@ -69,6 +79,56 @@ class ConfigError(Exception):
     """Raised for a malformed or unreadable deadmans.json."""
 
 
+def local_timezone() -> dt.tzinfo:
+    """The host's current UTC offset as a concrete tzinfo.
+
+    The offset is read once, so a config left on "local" across a daylight
+    saving transition is off by an hour until the next run. Name the zone
+    explicitly (``"timezone": "Australia/Brisbane"``) if that matters.
+    """
+    offset = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
+    return dt.timezone(offset)
+
+
+def resolve_timezone(spec: str | None) -> dt.tzinfo:
+    """Turn a config `timezone` value into a tzinfo.
+
+    Accepts "local" (the default), "UTC"/"Z", a fixed offset such as
+    "+10:00" or "-0500", or an IANA zone name such as "Australia/Brisbane".
+    IANA names need a tz database: it ships with most Linux and macOS
+    installs, and on Windows it comes from the `tzdata` package. When one
+    cannot be resolved this raises rather than quietly falling back, because
+    a silent fallback to the wrong clock is the bug this key exists to fix.
+    """
+    if spec is None:
+        return local_timezone()
+    text = spec.strip()
+    if not text or text.lower() == "local":
+        return local_timezone()
+    if text.upper() in {"UTC", "Z"}:
+        return dt.timezone.utc
+    match = _OFFSET_RE.match(text)
+    if match:
+        delta = dt.timedelta(
+            hours=int(match.group("hh")), minutes=int(match.group("mm"))
+        )
+        if delta > dt.timedelta(hours=24):
+            raise ConfigError(f"timezone offset out of range: {spec!r}")
+        return dt.timezone(-delta if match.group("sign") == "-" else delta)
+    try:
+        return ZoneInfo(text)
+    except Exception as exc:
+        raise ConfigError(
+            f"unknown timezone {spec!r}: expected 'local', 'UTC', an offset "
+            f"like '+10:00', or an installed IANA zone name ({exc})"
+        ) from exc
+
+
+def as_aware(value: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
+    """Read a naive datetime as `tz`; leave an already-aware one alone."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=tz)
+
+
 class Task(NamedTuple):
     name: str
     max_age_hours: float
@@ -89,6 +149,7 @@ class Config(NamedTuple):
     tasks: dict[str, Task]
     log_dir: Path
     log_pattern: str
+    tzinfo: dt.tzinfo
 
 
 def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
@@ -149,6 +210,14 @@ def load_config(path: Path) -> Config:
     if not isinstance(log_pattern, str) or not log_pattern:
         raise ConfigError(f"{path}: log_pattern must be a non-empty string")
 
+    tz_value = raw.get("timezone", DEFAULT_TIMEZONE)
+    if not isinstance(tz_value, str) or not tz_value:
+        raise ConfigError(f"{path}: timezone must be a non-empty string")
+    try:
+        tzinfo = resolve_timezone(tz_value)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
     task_entries = raw.get("tasks")
     if not isinstance(task_entries, list) or not task_entries:
         raise ConfigError(f"{path}: tasks must be a non-empty list")
@@ -197,7 +266,7 @@ def load_config(path: Path) -> Config:
             manual=manual,
         )
 
-    return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern)
+    return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
 
 
 def latest_log(task: str, log_dir: Path, log_pattern: str) -> Path | None:
@@ -216,7 +285,10 @@ def latest_log(task: str, log_dir: Path, log_pattern: str) -> Path | None:
     return max(candidates, key=lambda p: p.name)
 
 
-def parse_log_time(log: Path, task: str, log_pattern: str) -> dt.datetime | None:
+def parse_log_time(
+    log: Path, task: str, log_pattern: str, tz: dt.tzinfo | None = None
+) -> dt.datetime | None:
+    """The timestamp encoded in a log filename, read as `tz` (default local)."""
     matcher = compile_log_pattern(log_pattern, task)
     match = matcher.match(log.name)
     if not match:
@@ -224,7 +296,7 @@ def parse_log_time(log: Path, task: str, log_pattern: str) -> dt.datetime | None
     try:
         return dt.datetime.strptime(
             f"{match.group('date')}-{match.group('time')}", "%Y-%m-%d-%H%M"
-        )
+        ).replace(tzinfo=tz or local_timezone())
     except ValueError:
         # Matched the digit shape (e.g. a filename with month=99) but is not
         # a real date. Treat as an unknown timestamp rather than crashing the
@@ -237,15 +309,20 @@ def check_task(
     log_dir: Path,
     log_pattern: str,
     now: dt.datetime | None = None,
+    tz: dt.tzinfo | None = None,
 ) -> Status:
-    now = now or dt.datetime.now()
+    tz = tz or local_timezone()
+    # A caller passing a naive `now` (a test, a fixed clock) means it in the
+    # same zone the log stamps are read in, so read it that way rather than
+    # raising on the aware/naive subtraction below.
+    now = as_aware(now, tz) if now else dt.datetime.now(tz)
     log = latest_log(task.name, log_dir, log_pattern)
     if log is None:
         if task.manual:
             return Status(task.name, "MANUAL_OK", None, None, "manual task; no log yet")
         return Status(task.name, "NEVER_RAN", None, None, "no log file matches pattern")
 
-    log_time = parse_log_time(log, task.name, log_pattern)
+    log_time = parse_log_time(log, task.name, log_pattern, tz)
     age_hours = (now - log_time).total_seconds() / 3600.0 if log_time else None
 
     try:
@@ -290,9 +367,10 @@ def check_task(
     return Status(task.name, "FRESH", log_time, age_hours, "ok")
 
 
-def render_text(statuses: list[Status]) -> str:
+def render_text(statuses: list[Status], tz: dt.tzinfo | None = None) -> str:
     lines = [
-        "Task freshness check -- " + dt.datetime.now().isoformat(timespec="seconds"),
+        "Task freshness check -- "
+        + dt.datetime.now(tz or local_timezone()).isoformat(timespec="seconds"),
         "",
     ]
     width = max(len(s.task) for s in statuses)
@@ -302,7 +380,7 @@ def render_text(statuses: list[Status]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_json(statuses: list[Status]) -> str:
+def render_json(statuses: list[Status], tz: dt.tzinfo | None = None) -> str:
     payload = [
         {
             "task": s.task,
@@ -315,7 +393,9 @@ def render_json(statuses: list[Status]) -> str:
     ]
     return json.dumps(
         {
-            "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "checked_at": dt.datetime.now(tz or local_timezone()).isoformat(
+                timespec="seconds"
+            ),
             "tasks": payload,
         },
         indent=2,
@@ -337,13 +417,14 @@ def cmd_check(config_path: Path, only_task: str | None, as_json: bool) -> int:
         tasks = {only_task: tasks[only_task]}
 
     statuses = [
-        check_task(t, config.log_dir, config.log_pattern) for t in tasks.values()
+        check_task(t, config.log_dir, config.log_pattern, tz=config.tzinfo)
+        for t in tasks.values()
     ]
 
     if as_json:
-        print(render_json(statuses))
+        print(render_json(statuses, config.tzinfo))
     else:
-        print(render_text(statuses))
+        print(render_text(statuses, config.tzinfo))
 
     return 0 if all(s.state in OK_STATES for s in statuses) else 1
 
@@ -364,7 +445,9 @@ def cmd_selftest() -> int:
     a freshly copied deadmans.py, independent of the repo's own
     test_deadmans.py suite."""
     failures: list[str] = []
-    now = dt.datetime(2026, 1, 15, 12, 0, 0)
+    # A fixed clock, pinned to UTC so the scenarios below mean the same thing
+    # on every host this file gets copied to.
+    now = dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
 
     with tempfile.TemporaryDirectory() as tmp:
         log_dir = Path(tmp) / "logs"
@@ -375,7 +458,9 @@ def cmd_selftest() -> int:
             (log_dir / name).write_text(body, encoding="utf-8")
 
         def expect(label: str, task: Task, expected_state: str) -> None:
-            result = check_task(task, log_dir, DEFAULT_LOG_PATTERN, now=now)
+            result = check_task(
+                task, log_dir, DEFAULT_LOG_PATTERN, now=now, tz=dt.timezone.utc
+            )
             if result.state != expected_state:
                 failures.append(
                     f"{label}: expected {expected_state}, got {result.state} ({result.detail})"

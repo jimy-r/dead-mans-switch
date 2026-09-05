@@ -1,6 +1,7 @@
 {
   "log_dir": "logs",
   "log_pattern": "{task}_{date}-{time}.log",
+  "timezone": "local",
   "tasks": [
     {
       "name": "nightly-report",

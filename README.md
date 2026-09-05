@@ -49,6 +49,7 @@ Top-level keys in `deadmans.json`.
 |---|---|---|
 | `log_dir` | Directory the tool scans for logs, resolved relative to the config file if not absolute | `logs` |
 | `log_pattern` | Filename template using `{task}`, `{date}`, `{time}` placeholders | `{task}_{date}-{time}.log` |
+| `timezone` | Which clock wrote the `{date}`/`{time}` in your log filenames. `local`, `UTC`, a fixed offset like `+10:00`, or an IANA name like `Australia/Brisbane` | `local` |
 | `tasks` | List of tracked task objects, see below | required |
 
 Keys inside each task object.
@@ -62,6 +63,14 @@ Keys inside each task object.
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
 
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
+
+## Timezones
+
+A log filename carries no offset. `nightly-report_2026-01-15-0000.log` is 9pm or 10am depending on who wrote it, and the checker has no way to tell from the name alone. If your job stamps its filenames in UTC and you run the check from Brisbane, every task reads ten hours fresher than it is, which is the wrong direction for a tool whose whole job is catching things that stopped.
+
+Set `timezone` to whichever clock the *producer* uses. `local` (the default) is correct when the job and the checker run on the same host. `UTC` is the common answer for anything containerised or CI-driven. An IANA name needs a tz database on the machine, which ships with most Linux and macOS installs and comes from the `tzdata` package on Windows; an unresolvable name is a config error rather than a silent fall back to the wrong clock.
+
+One caveat on `local`: the host offset is read once per run, so a config left on `local` across a daylight saving boundary is an hour out until the next run. Name the zone if that matters to you.
 
 ## The manual flag
 
