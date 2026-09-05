@@ -12,12 +12,13 @@ Catching more failure modes does not fix this. Checking for success directly doe
 
 ## How it works
 
-Each job you track writes a plain success string (a sentinel) into its own log file when it finishes. `deadmans.py` scans your log directory for each task's most recent log, inside a staleness window you configure, and checks for that sentinel. A task is a finding if:
+Each job you track writes a plain success string (a sentinel) into its own log file when it finishes. `deadmans.py` scans your log directory for each task's most recent log, inside a staleness window you configure, and checks for that sentinel on a line of its own. A task is a finding if:
 
 - no log exists yet, and the task is not flagged manual
 - the most recent log is older than its configured window
 - the most recent log has no success sentinel
 - the most recent log carries a failure sentinel instead
+- the most recent log shows the job starting but never finishing
 
 The exit code inverts what you would expect from a linter. 0 means every tracked task is fresh. 1 means at least one needs attention. That makes `deadmans.py check` a one-line addition to a cron job or a CI pipeline.
 
@@ -67,6 +68,7 @@ Top-level keys in `deadmans.json`.
 |---|---|---|
 | `log_dir` | Directory the tool scans for logs, resolved relative to the config file if not absolute | `logs` |
 | `log_pattern` | Filename template using `{task}`, `{date}`, `{time}` placeholders | `{task}_{date}-{time}.log` |
+| `timezone` | Which clock wrote the `{date}`/`{time}` in your log filenames. `local`, `UTC`, a fixed offset like `+10:00`, or an IANA name like `Australia/Brisbane` | `local` |
 | `tasks` | List of tracked task objects, see below | required |
 
 Keys inside each task object.
@@ -77,9 +79,20 @@ Keys inside each task object.
 | `max_age_hours` | How old the most recent log can be before it counts as stale | required |
 | `sentinel` | Success string to look for in the most recent log | required |
 | `failure_sentinel` | Optional string that marks an explicit failure | none |
+| `start_sentinel` | Optional string the job writes when it *begins*, so a run that starts and never finishes reports `HUNG` rather than `NO_SENTINEL` | none |
+| `max_runtime_hours` | How long a started run may go without finishing before it counts as hung. Needs `start_sentinel` | none |
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
+| `artefact` | Optional second freshness signal keyed to what the job *produces* rather than to its log, see below | none |
 
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
+
+## Timezones
+
+A log filename carries no offset. `nightly-report_2026-01-15-0000.log` is 9pm or 10am depending on who wrote it, and the checker has no way to tell from the name alone. If your job stamps its filenames in UTC and you run the check from Brisbane, every task reads ten hours fresher than it is, which is the wrong direction for a tool whose whole job is catching things that stopped.
+
+Set `timezone` to whichever clock the *producer* uses. `local` (the default) is correct when the job and the checker run on the same host. `UTC` is the common answer for anything containerised or CI-driven. An IANA name needs a tz database on the machine, which ships with most Linux and macOS installs and comes from the `tzdata` package on Windows; an unresolvable name is a config error rather than a silent fall back to the wrong clock.
+
+One caveat on `local`: the host offset is read once per run, so a config left on `local` across a daylight saving boundary is an hour out until the next run. Name the zone if that matters to you.
 
 ## The manual flag
 
@@ -87,11 +100,63 @@ Not every tracked task runs on a fixed clock. Some get invoked by hand, or by an
 
 Set `manual: true` for those tasks. A manual task with no log at all reports `MANUAL_OK`, not `NEVER_RAN`. After that first run, the same staleness window applies as any other task. `manual` only changes what "no log yet" means, not what "an old log" means.
 
+## Checking the output instead of the log
+
+A log line only exists if the job ran through whatever wrapper writes the log. Run the same job another way and the log stays where it was while the real work happens. This is not hypothetical: the lane this tool came from reported CRITICAL for ten days because the task had moved to a different invocation path that wrote no log, while the thing it produces was being updated the whole time. A permanent false-stale trains you to ignore the switch, which is the one outcome worse than not having it.
+
+Point `artefact` at what the job actually produces and that signal counts too.
+
+```json
+{
+  "name": "weekly-audit",
+  "max_age_hours": 192,
+  "sentinel": "WEEKLY_AUDIT_OK",
+  "artefact": {
+    "path": "state/findings.jsonl",
+    "format": "jsonl",
+    "timestamp_field": "ts",
+    "match": { "source": "^weekly-audit-\\d{4}" }
+  }
+}
+```
+
+`format: "mtime"` (the default) takes the file's modification time, which is enough for a report, an export, a rendered page. `format: "jsonl"` reads a newline-delimited JSON file and takes the newest `timestamp_field` value across its records.
+
+`match` is what keeps `jsonl` honest. Each key names a field and each value is a regex the field must match, so only records the tracked job writes are counted. Without it any append to a shared file reports the lane fresh, and a false `FRESH` on a dead-man's switch is worse than the stale it replaces.
+
+When the artefact is the newer of the two signals it decides the state, and the older log's sentinel is not scored, because the artefact already shows the job produced its output. When the log is newer, nothing changes. A relative `path` resolves against the config file's directory, and an artefact file that does not exist yet is simply no signal rather than an error.
+
+## Jobs that start and never finish
+
+A success sentinel tells you a run finished. It cannot tell you whether a run that produced no sentinel never started, or started and wedged halfway. Both report `NO_SENTINEL`, and those are different problems with different fixes: a scheduler that skipped the job, versus a job that hangs on something.
+
+Have the job write a `start_sentinel` line as its first act, and the two split apart. A log carrying the start string but neither a success nor a failure string reports `HUNG` instead, and the detail line says how long ago it began.
+
+```json
+{
+  "name": "nightly-report",
+  "max_age_hours": 30,
+  "sentinel": "NIGHTLY_REPORT_OK",
+  "start_sentinel": "NIGHTLY_REPORT_START",
+  "max_runtime_hours": 2
+}
+```
+
+`max_runtime_hours` is the allowance a run gets before an unfinished start counts as hung. Inside it the task reports `RUNNING`, which passes, so checking while a long job is genuinely mid-flight doesn't raise a false alarm. Leave it out and any unfinished start is `HUNG` immediately, which is fine when nothing you track runs long enough to overlap a check.
+
+Staleness still wins. A started-but-unfinished log old enough to breach `max_age_hours` reports `STALE`, because at that point the age is the more urgent fact.
+
 ## What "fresh" actually means
 
-`check` reports one of these states per task. `FRESH`, `STALE`, `FAILED`, `NO_SENTINEL`, `NEVER_RAN`, `MANUAL_OK`, or `LOG_UNREADABLE` if the log file itself cannot be read. Only `FRESH` and `MANUAL_OK` pass.
+`check` reports one of these states per task. `FRESH`, `STALE`, `FAILED`, `HUNG`, `RUNNING`, `NO_SENTINEL`, `NEVER_RAN`, `MANUAL_OK`, or `LOG_UNREADABLE` if the log file itself cannot be read. `FRESH`, `RUNNING` and `MANUAL_OK` pass; everything else is a finding.
 
 Staleness is checked first. A log old enough to breach its window is `STALE` regardless of what it contains. Inside the window, being recent is not automatically a pass. A log without the success sentinel still fails the check, whether that is because the job crashed and left a `failure_sentinel` behind, or because it exited without writing anything conclusive at all.
+
+## What counts as writing the sentinel
+
+The sentinel has to open a line. A log that only mentions the string somewhere in a sentence does not pass, because that mention is exactly what a run quoting its own last failure looks like, or a summary line naming the sentinel it went looking for. Treating a mention as a success is a false `FRESH` on a dead-man's switch, which is a worse failure than the false finding it would avoid.
+
+Leading whitespace, backticks, asterisks and underscores in front of the sentinel are fine, so a log line written as `` `MY_JOB_OK` `` or `**MY_JOB_OK**` still counts. A leading byte order mark on the file does not hide the first line. A sentinel of `MY_JOB_OK` does not match `MY_JOB_OK_PENDING`.
 
 ## CLI
 

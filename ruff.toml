@@ -7,8 +7,14 @@ target-version = "py310"
 
 [lint]
 # The widest set this codebase is verified clean under (2026-09-05):
-# pycodestyle + pyflakes + isort + bugbear + pyupgrade.
-select = ["E", "W", "F", "I", "B", "UP"]
+# pycodestyle + pyflakes + isort + bugbear + pyupgrade + flake8-datetimez.
+select = ["E", "W", "F", "I", "B", "UP", "DTZ"]
 # Line length is the formatter's job; E501 residuals are strings/URLs the
 # formatter deliberately leaves alone.
 ignore = ["E501"]
+
+[lint.per-file-ignores]
+# The suite pins fixed naive clocks on purpose -- reading a naive `now` in
+# the configured zone is behaviour the tests exist to cover, so DTZ there
+# would flag the fixtures rather than a bug.
+"test_deadmans.py" = ["DTZ"]

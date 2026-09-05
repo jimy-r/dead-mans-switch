@@ -35,24 +35,41 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
+from zoneinfo import ZoneInfo
 
 DEFAULT_CONFIG_PATH = Path("deadmans.json")
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_PATTERN = "{task}_{date}-{time}.log"
+DEFAULT_TIMEZONE = "local"
+
+# A log filename carries no offset, so "2026-01-15-0930" is only meaningful
+# once you say which clock wrote it. Comparing that naive stamp against a
+# naive local now() silently skews every age by the gap between the two --
+# a UTC-stamping producer read from a UTC+10 host reports every job ten
+# hours fresher than it is. Both sides are made aware instead.
+_OFFSET_RE = re.compile(r"^(?P<sign>[+-])(?P<hh>\d{2}):?(?P<mm>\d{2})$")
+
+# Decoration a sentinel picks up on its way into a log: indentation from a
+# shell wrapper, backticks or asterisks from anything that formats markdown.
+# Tolerated in front of the sentinel; the sentinel still has to open the line.
+_SENTINEL_DECORATION = r"[\s*_`]*"
 
 # States that mean "this task is not a finding". Everything else -- STALE,
-# FAILED, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
-OK_STATES = frozenset({"FRESH", "MANUAL_OK"})
+# FAILED, HUNG, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
+OK_STATES = frozenset({"FRESH", "MANUAL_OK", "RUNNING"})
 
 EXAMPLE_CONFIG: dict[str, Any] = {
     "log_dir": "logs",
     "log_pattern": "{task}_{date}-{time}.log",
+    "timezone": "local",
     "tasks": [
         {
             "name": "nightly-report",
             "max_age_hours": 30,
             "sentinel": "NIGHTLY_REPORT_OK",
             "failure_sentinel": "NIGHTLY_REPORT_FAILED",
+            "start_sentinel": "NIGHTLY_REPORT_START",
+            "max_runtime_hours": 2,
             "manual": False,
         },
         {
@@ -69,12 +86,81 @@ class ConfigError(Exception):
     """Raised for a malformed or unreadable deadmans.json."""
 
 
+def local_timezone() -> dt.tzinfo:
+    """The host's current UTC offset as a concrete tzinfo.
+
+    The offset is read once, so a config left on "local" across a daylight
+    saving transition is off by an hour until the next run. Name the zone
+    explicitly (``"timezone": "Australia/Brisbane"``) if that matters.
+    """
+    offset = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
+    return dt.timezone(offset)
+
+
+def resolve_timezone(spec: str | None) -> dt.tzinfo:
+    """Turn a config `timezone` value into a tzinfo.
+
+    Accepts "local" (the default), "UTC"/"Z", a fixed offset such as
+    "+10:00" or "-0500", or an IANA zone name such as "Australia/Brisbane".
+    IANA names need a tz database: it ships with most Linux and macOS
+    installs, and on Windows it comes from the `tzdata` package. When one
+    cannot be resolved this raises rather than quietly falling back, because
+    a silent fallback to the wrong clock is the bug this key exists to fix.
+    """
+    if spec is None:
+        return local_timezone()
+    text = spec.strip()
+    if not text or text.lower() == "local":
+        return local_timezone()
+    if text.upper() in {"UTC", "Z"}:
+        return dt.timezone.utc
+    match = _OFFSET_RE.match(text)
+    if match:
+        delta = dt.timedelta(
+            hours=int(match.group("hh")), minutes=int(match.group("mm"))
+        )
+        if delta > dt.timedelta(hours=24):
+            raise ConfigError(f"timezone offset out of range: {spec!r}")
+        return dt.timezone(-delta if match.group("sign") == "-" else delta)
+    try:
+        return ZoneInfo(text)
+    except Exception as exc:
+        raise ConfigError(
+            f"unknown timezone {spec!r}: expected 'local', 'UTC', an offset "
+            f"like '+10:00', or an installed IANA zone name ({exc})"
+        ) from exc
+
+
+def as_aware(value: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
+    """Read a naive datetime as `tz`; leave an already-aware one alone."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=tz)
+
+
+class Artefact(NamedTuple):
+    """A second freshness signal, keyed to what the job produces.
+
+    A log line only exists if the job ran through whatever wrapper writes the
+    log. Invoke the same job another way -- by hand, from a different host,
+    through an agent rather than its cron entry -- and the log stays where it
+    was while the real work happens, so the switch reports a permanent
+    false-stale on a task that is running fine.
+    """
+
+    path: Path
+    format: str
+    timestamp_field: str
+    match: tuple[tuple[str, re.Pattern[str]], ...]
+
+
 class Task(NamedTuple):
     name: str
     max_age_hours: float
     sentinel: str
     failure_sentinel: str | None
     manual: bool
+    start_sentinel: str | None = None
+    max_runtime_hours: float | None = None
+    artefact: Artefact | None = None
 
 
 class Status(NamedTuple):
@@ -89,6 +175,7 @@ class Config(NamedTuple):
     tasks: dict[str, Task]
     log_dir: Path
     log_pattern: str
+    tzinfo: dt.tzinfo
 
 
 def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
@@ -123,6 +210,109 @@ def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
     return re.compile("^" + "".join(regex_parts) + "$")
 
 
+ARTEFACT_FORMATS = ("mtime", "jsonl")
+
+
+def parse_artefact(entry: Any, base: Path, where: str) -> Artefact:
+    """Validate one task's `artefact` object into an Artefact."""
+    if not isinstance(entry, dict):
+        raise ConfigError(f"{where}: artefact must be an object")
+
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ConfigError(f"{where}: artefact needs a non-empty path")
+    artefact_path = Path(raw_path)
+    if not artefact_path.is_absolute():
+        artefact_path = base / artefact_path
+
+    fmt = entry.get("format", "mtime")
+    if fmt not in ARTEFACT_FORMATS:
+        raise ConfigError(
+            f"{where}: artefact format must be one of {', '.join(ARTEFACT_FORMATS)}"
+        )
+
+    field = entry.get("timestamp_field", "ts")
+    if not isinstance(field, str) or not field:
+        raise ConfigError(
+            f"{where}: artefact timestamp_field must be a non-empty string"
+        )
+
+    raw_match = entry.get("match", {})
+    if not isinstance(raw_match, dict):
+        raise ConfigError(f"{where}: artefact match must be an object")
+    if raw_match and fmt != "jsonl":
+        raise ConfigError(f"{where}: artefact match only applies to the jsonl format")
+    match: list[tuple[str, re.Pattern[str]]] = []
+    for key, pattern in raw_match.items():
+        if not isinstance(pattern, str):
+            raise ConfigError(f"{where}: artefact match {key!r} must be a regex string")
+        try:
+            match.append((key, re.compile(pattern)))
+        except re.error as exc:
+            raise ConfigError(
+                f"{where}: artefact match {key!r} is not a valid regex: {exc}"
+            ) from exc
+
+    return Artefact(
+        path=artefact_path,
+        format=fmt,
+        timestamp_field=field,
+        match=tuple(match),
+    )
+
+
+def latest_artefact_time(artefact: Artefact, tz: dt.tzinfo) -> dt.datetime | None:
+    """When the artefact last changed, or None if it carries no usable signal.
+
+    A missing file is not an error. It means this task has produced nothing
+    yet, and the log-based path decides what that is worth.
+    """
+    if not artefact.path.is_file():
+        return None
+
+    if artefact.format == "mtime":
+        try:
+            return dt.datetime.fromtimestamp(artefact.path.stat().st_mtime, tz)
+        except OSError:
+            return None
+
+    try:
+        text = artefact.path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    newest: dt.datetime | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        # Matching on the record, not merely on the file changing, is what
+        # keeps an unrelated write from reporting the lane fresh. A false
+        # FRESH on a dead-man's switch is worse than the stale it replaces.
+        if any(
+            not pattern.search(str(record.get(key, "")))
+            for key, pattern in artefact.match
+        ):
+            continue
+        stamp = record.get(artefact.timestamp_field)
+        if not isinstance(stamp, str):
+            continue
+        try:
+            when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        when = as_aware(when, tz)
+        if newest is None or when > newest:
+            newest = when
+    return newest
+
+
 def load_config(path: Path) -> Config:
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
@@ -148,6 +338,14 @@ def load_config(path: Path) -> Config:
     log_pattern = raw.get("log_pattern", DEFAULT_LOG_PATTERN)
     if not isinstance(log_pattern, str) or not log_pattern:
         raise ConfigError(f"{path}: log_pattern must be a non-empty string")
+
+    tz_value = raw.get("timezone", DEFAULT_TIMEZONE)
+    if not isinstance(tz_value, str) or not tz_value:
+        raise ConfigError(f"{path}: timezone must be a non-empty string")
+    try:
+        tzinfo = resolve_timezone(tz_value)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
     task_entries = raw.get("tasks")
     if not isinstance(task_entries, list) or not task_entries:
@@ -189,15 +387,55 @@ def load_config(path: Path) -> Config:
         if not isinstance(manual, bool):
             raise ConfigError(f"{path}: task {name!r} manual must be true or false")
 
+        start_sentinel = entry.get("start_sentinel")
+        if start_sentinel is not None and (
+            not isinstance(start_sentinel, str) or not start_sentinel
+        ):
+            raise ConfigError(
+                f"{path}: task {name!r} start_sentinel must be a non-empty "
+                "string if present"
+            )
+
+        max_runtime_hours = entry.get("max_runtime_hours")
+        if max_runtime_hours is not None:
+            if start_sentinel is None:
+                raise ConfigError(
+                    f"{path}: task {name!r} sets max_runtime_hours but no "
+                    "start_sentinel, so nothing marks when the run began"
+                )
+            if not isinstance(max_runtime_hours, (int, float)) or isinstance(
+                max_runtime_hours, bool
+            ):
+                raise ConfigError(
+                    f"{path}: task {name!r} max_runtime_hours must be numeric"
+                )
+            if max_runtime_hours <= 0:
+                raise ConfigError(
+                    f"{path}: task {name!r} max_runtime_hours must be positive"
+                )
+            max_runtime_hours = float(max_runtime_hours)
+
+        raw_artefact = entry.get("artefact")
+        artefact = (
+            None
+            if raw_artefact is None
+            else parse_artefact(
+                raw_artefact, path.resolve().parent, f"{path}: task {name!r}"
+            )
+        )
+
         tasks[name] = Task(
             name=name,
             max_age_hours=float(max_age_hours),
             sentinel=sentinel,
             failure_sentinel=failure_sentinel,
             manual=manual,
+            start_sentinel=start_sentinel,
+            max_runtime_hours=max_runtime_hours,
+            artefact=artefact,
         )
 
-    return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern)
+    return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
 
 
 def latest_log(task: str, log_dir: Path, log_pattern: str) -> Path | None:
@@ -216,7 +454,10 @@ def latest_log(task: str, log_dir: Path, log_pattern: str) -> Path | None:
     return max(candidates, key=lambda p: p.name)
 
 
-def parse_log_time(log: Path, task: str, log_pattern: str) -> dt.datetime | None:
+def parse_log_time(
+    log: Path, task: str, log_pattern: str, tz: dt.tzinfo | None = None
+) -> dt.datetime | None:
+    """The timestamp encoded in a log filename, read as `tz` (default local)."""
     matcher = compile_log_pattern(log_pattern, task)
     match = matcher.match(log.name)
     if not match:
@@ -224,7 +465,7 @@ def parse_log_time(log: Path, task: str, log_pattern: str) -> dt.datetime | None
     try:
         return dt.datetime.strptime(
             f"{match.group('date')}-{match.group('time')}", "%Y-%m-%d-%H%M"
-        )
+        ).replace(tzinfo=tz or local_timezone())
     except ValueError:
         # Matched the digit shape (e.g. a filename with month=99) but is not
         # a real date. Treat as an unknown timestamp rather than crashing the
@@ -232,21 +473,75 @@ def parse_log_time(log: Path, task: str, log_pattern: str) -> dt.datetime | None
         return None
 
 
+def sentinel_matches(sentinel: str, body: str) -> bool:
+    """True when `sentinel` opens a line of `body`.
+
+    A bare ``sentinel in body`` substring test passes a log that merely
+    mentions the string: a run that quotes its own last failure, a summary
+    line naming the sentinel it was looking for, a config file pasted into
+    the output. That is a false FRESH on a dead-man's switch, which is worse
+    than the false finding it avoids. Anchoring to the start of a line keeps
+    the mention out while still accepting the decoration a real sentinel line
+    picks up in practice.
+    """
+    head = body.lstrip("﻿")  # some producers open the file with a BOM
+    # Stop a sentinel matching a longer token that starts with it, but only
+    # when it ends in a word character -- \b after "OK!" would never match.
+    tail = r"\b" if sentinel[-1:].isalnum() or sentinel.endswith("_") else ""
+    return bool(
+        re.search(rf"^{_SENTINEL_DECORATION}{re.escape(sentinel)}{tail}", head, re.M)
+    )
+
+
 def check_task(
     task: Task,
     log_dir: Path,
     log_pattern: str,
     now: dt.datetime | None = None,
+    tz: dt.tzinfo | None = None,
 ) -> Status:
-    now = now or dt.datetime.now()
+    tz = tz or local_timezone()
+    # A caller passing a naive `now` (a test, a fixed clock) means it in the
+    # same zone the log stamps are read in, so read it that way rather than
+    # raising on the aware/naive subtraction below.
+    now = as_aware(now, tz) if now else dt.datetime.now(tz)
+
+    artefact_time = (
+        latest_artefact_time(task.artefact, tz) if task.artefact is not None else None
+    )
+
+    def from_artefact(when: dt.datetime, note: str) -> Status:
+        age = (now - when).total_seconds() / 3600.0
+        label = task.artefact.path.name
+        if age > task.max_age_hours:
+            return Status(
+                task.name,
+                "STALE",
+                when,
+                age,
+                f"newest {label} record is {age:.1f}h old "
+                f"(max {task.max_age_hours:.1f}h)",
+            )
+        return Status(
+            task.name, "FRESH", when, age, f"{label} updated {age:.1f}h ago; {note}"
+        )
+
     log = latest_log(task.name, log_dir, log_pattern)
     if log is None:
+        if artefact_time is not None:
+            return from_artefact(artefact_time, "no log file matches pattern")
         if task.manual:
             return Status(task.name, "MANUAL_OK", None, None, "manual task; no log yet")
         return Status(task.name, "NEVER_RAN", None, None, "no log file matches pattern")
 
-    log_time = parse_log_time(log, task.name, log_pattern)
+    log_time = parse_log_time(log, task.name, log_pattern, tz)
     age_hours = (now - log_time).total_seconds() / 3600.0 if log_time else None
+
+    # When the artefact is the newer signal, it is also the evidence of
+    # success -- the job produced its output. Scoring an older log's sentinel
+    # at that point reports on a run the artefact has already superseded.
+    if artefact_time is not None and (log_time is None or artefact_time > log_time):
+        return from_artefact(artefact_time, "newer than the last log")
 
     try:
         body = log.read_text(encoding="utf-8", errors="replace")
@@ -255,8 +550,10 @@ def check_task(
             task.name, "LOG_UNREADABLE", log_time, age_hours, f"read error: {exc}"
         )
 
-    success = task.sentinel in body
-    failure = task.failure_sentinel is not None and task.failure_sentinel in body
+    success = sentinel_matches(task.sentinel, body)
+    failure = task.failure_sentinel is not None and sentinel_matches(
+        task.failure_sentinel, body
+    )
 
     # Staleness is checked first and short-circuits: a log old enough to
     # breach the window is a finding regardless of what it contains. Within
@@ -279,6 +576,35 @@ def check_task(
             age_hours,
             "failure sentinel present, no success sentinel",
         )
+    # A log that opened but never reached its success string is a different
+    # animal from one that says nothing at all: the job fired, then died or
+    # wedged partway. Without a start sentinel both look like NO_SENTINEL,
+    # and the operator cannot tell "the scheduler skipped it" from "it hung".
+    if (
+        not success
+        and task.start_sentinel
+        and sentinel_matches(task.start_sentinel, body)
+    ):
+        grace = task.max_runtime_hours
+        if grace is not None and age_hours is not None and age_hours <= grace:
+            return Status(
+                task.name,
+                "RUNNING",
+                log_time,
+                age_hours,
+                f"started {age_hours:.1f}h ago, inside the {grace:.1f}h allowance",
+            )
+        started = (
+            f"{age_hours:.1f}h ago" if age_hours is not None else "at an unknown time"
+        )
+        return Status(
+            task.name,
+            "HUNG",
+            log_time,
+            age_hours,
+            f"started {started}, no success or failure sentinel since",
+        )
+
     if not success:
         return Status(
             task.name,
@@ -290,9 +616,10 @@ def check_task(
     return Status(task.name, "FRESH", log_time, age_hours, "ok")
 
 
-def render_text(statuses: list[Status]) -> str:
+def render_text(statuses: list[Status], tz: dt.tzinfo | None = None) -> str:
     lines = [
-        "Task freshness check -- " + dt.datetime.now().isoformat(timespec="seconds"),
+        "Task freshness check -- "
+        + dt.datetime.now(tz or local_timezone()).isoformat(timespec="seconds"),
         "",
     ]
     width = max(len(s.task) for s in statuses)
@@ -302,7 +629,7 @@ def render_text(statuses: list[Status]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_json(statuses: list[Status]) -> str:
+def render_json(statuses: list[Status], tz: dt.tzinfo | None = None) -> str:
     payload = [
         {
             "task": s.task,
@@ -315,7 +642,9 @@ def render_json(statuses: list[Status]) -> str:
     ]
     return json.dumps(
         {
-            "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "checked_at": dt.datetime.now(tz or local_timezone()).isoformat(
+                timespec="seconds"
+            ),
             "tasks": payload,
         },
         indent=2,
@@ -337,13 +666,14 @@ def cmd_check(config_path: Path, only_task: str | None, as_json: bool) -> int:
         tasks = {only_task: tasks[only_task]}
 
     statuses = [
-        check_task(t, config.log_dir, config.log_pattern) for t in tasks.values()
+        check_task(t, config.log_dir, config.log_pattern, tz=config.tzinfo)
+        for t in tasks.values()
     ]
 
     if as_json:
-        print(render_json(statuses))
+        print(render_json(statuses, config.tzinfo))
     else:
-        print(render_text(statuses))
+        print(render_text(statuses, config.tzinfo))
 
     return 0 if all(s.state in OK_STATES for s in statuses) else 1
 
@@ -364,7 +694,9 @@ def cmd_selftest() -> int:
     a freshly copied deadmans.py, independent of the repo's own
     test_deadmans.py suite."""
     failures: list[str] = []
-    now = dt.datetime(2026, 1, 15, 12, 0, 0)
+    # A fixed clock, pinned to UTC so the scenarios below mean the same thing
+    # on every host this file gets copied to.
+    now = dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
 
     with tempfile.TemporaryDirectory() as tmp:
         log_dir = Path(tmp) / "logs"
@@ -375,7 +707,9 @@ def cmd_selftest() -> int:
             (log_dir / name).write_text(body, encoding="utf-8")
 
         def expect(label: str, task: Task, expected_state: str) -> None:
-            result = check_task(task, log_dir, DEFAULT_LOG_PATTERN, now=now)
+            result = check_task(
+                task, log_dir, DEFAULT_LOG_PATTERN, now=now, tz=dt.timezone.utc
+            )
             if result.state != expected_state:
                 failures.append(
                     f"{label}: expected {expected_state}, got {result.state} ({result.detail})"
@@ -403,10 +737,64 @@ def cmd_selftest() -> int:
         )
         expect("sentinel-less log", scenario("no-sentinel-case"), "NO_SENTINEL")
 
+        write_log(
+            "hung-case", now - dt.timedelta(hours=3), "START_SENTINEL\nworking...\n"
+        )
+        expect(
+            "started but never finished",
+            Task(
+                "hung-case",
+                24.0,
+                "OK_SENTINEL",
+                "FAIL_SENTINEL",
+                False,
+                start_sentinel="START_SENTINEL",
+                max_runtime_hours=1.0,
+            ),
+            "HUNG",
+        )
+
+        write_log(
+            "running-case",
+            now - dt.timedelta(minutes=10),
+            "START_SENTINEL\nworking...\n",
+        )
+        expect(
+            "started, still inside its runtime allowance",
+            Task(
+                "running-case",
+                24.0,
+                "OK_SENTINEL",
+                "FAIL_SENTINEL",
+                False,
+                start_sentinel="START_SENTINEL",
+                max_runtime_hours=1.0,
+            ),
+            "RUNNING",
+        )
+
         expect(
             "never ran",
             Task("never-ran", 24.0, "OK_SENTINEL", None, False),
             "NEVER_RAN",
+        )
+
+        ledger = Path(tmp) / "artefact.jsonl"
+        ledger.write_text(
+            json.dumps({"ts": (now - dt.timedelta(hours=2)).isoformat()}) + "\n",
+            encoding="utf-8",
+        )
+        expect(
+            "no log, but the artefact is fresh",
+            Task(
+                "artefact-case",
+                24.0,
+                "OK_SENTINEL",
+                None,
+                False,
+                artefact=Artefact(ledger, "jsonl", "ts", ()),
+            ),
+            "FRESH",
         )
         expect(
             "manual, no log",
