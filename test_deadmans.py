@@ -685,6 +685,198 @@ class TestStartSentinelConfig(TempDirCase):
             self.config(start_sentinel="GO", max_runtime_hours=True)
 
 
+class TestArtefactFreshness(TempDirCase):
+    """A task invoked outside its logging wrapper still produces its output.
+    Keying freshness on that output stops a permanent false-stale."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+        self.ledger = self.tmp_path / "findings.jsonl"
+
+    def task(self, **artefact_keys) -> deadmans.Task:
+        artefact = deadmans.parse_artefact(
+            {"path": str(self.ledger), **artefact_keys}, self.tmp_path, "test"
+        )
+        return deadmans.Task(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel=None,
+            manual=False,
+            artefact=artefact,
+        )
+
+    def write_ledger(self, *records: dict) -> None:
+        self.ledger.write_text(
+            "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+        )
+
+    def check(self, task: deadmans.Task) -> deadmans.Status:
+        return deadmans.check_task(
+            task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=self.now,
+            tz=dt.timezone.utc,
+        )
+
+    def test_fresh_artefact_rescues_a_task_with_no_log_at_all(self) -> None:
+        self.write_ledger({"ts": "2026-01-15T10:00:00", "event": "emit"})
+        result = self.check(self.task(format="jsonl"))
+        self.assertEqual(result.state, "FRESH")
+        self.assertAlmostEqual(result.age_hours, 2.0, places=3)
+
+    def test_without_an_artefact_the_same_task_never_ran(self) -> None:
+        plain = self.task(format="jsonl")._replace(artefact=None)
+        self.assertEqual(self.check(plain).state, "NEVER_RAN")
+
+    def test_stale_artefact_and_no_log_is_stale(self) -> None:
+        self.write_ledger({"ts": "2026-01-10T10:00:00", "event": "emit"})
+        self.assertEqual(self.check(self.task(format="jsonl")).state, "STALE")
+
+    def test_artefact_newer_than_the_log_wins(self) -> None:
+        # The log is old enough to breach the window on its own.
+        write_log(self.log_dir, "scheduled_2026-01-10-1000.log", "OK_SENTINEL\n")
+        self.write_ledger({"ts": "2026-01-15T09:00:00", "event": "emit"})
+        result = self.check(self.task(format="jsonl"))
+        self.assertEqual(result.state, "FRESH")
+        self.assertIn("newer than the last log", result.detail)
+
+    def test_older_artefact_leaves_the_log_in_charge(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "OK_SENTINEL\n")
+        self.write_ledger({"ts": "2026-01-11T09:00:00", "event": "emit"})
+        result = self.check(self.task(format="jsonl"))
+        self.assertEqual(result.state, "FRESH")
+        self.assertEqual(result.detail, "ok")
+
+    def test_missing_artefact_file_is_not_an_error(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "OK_SENTINEL\n")
+        self.assertEqual(self.check(self.task(format="jsonl")).state, "FRESH")
+
+    def test_match_filters_records_by_field(self) -> None:
+        # Only the audit-run record should count; the drain record is newer
+        # but does not mean the tracked job ran.
+        self.write_ledger(
+            {"ts": "2026-01-10T09:00:00", "source": "nightly-2026-01-10"},
+            {"ts": "2026-01-15T09:00:00", "source": "manual-drain"},
+        )
+        task = self.task(format="jsonl", match={"source": r"^nightly-\d{4}"})
+        self.assertEqual(self.check(task).state, "STALE")
+
+    def test_match_admits_the_record_it_names(self) -> None:
+        self.write_ledger(
+            {"ts": "2026-01-15T09:00:00", "source": "nightly-2026-01-15"},
+        )
+        task = self.task(format="jsonl", match={"source": r"^nightly-\d{4}"})
+        self.assertEqual(self.check(task).state, "FRESH")
+
+    def test_malformed_lines_are_skipped_not_fatal(self) -> None:
+        self.ledger.write_text(
+            "\n".join(
+                [
+                    "not json at all",
+                    "[1, 2, 3]",
+                    json.dumps({"ts": "nonsense"}),
+                    json.dumps({"nots": "2026-01-15T09:00:00"}),
+                    json.dumps({"ts": "2026-01-15T09:00:00"}),
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.check(self.task(format="jsonl")).state, "FRESH")
+
+    def test_naive_record_stamps_are_read_in_the_configured_zone(self) -> None:
+        self.write_ledger({"ts": "2026-01-15T10:00:00"})
+        aware = self.task(format="jsonl")
+        self.assertAlmostEqual(self.check(aware).age_hours, 2.0, places=3)
+
+    def test_zulu_suffix_parses(self) -> None:
+        self.write_ledger({"ts": "2026-01-15T10:00:00Z"})
+        self.assertAlmostEqual(
+            self.check(self.task(format="jsonl")).age_hours, 2.0, places=3
+        )
+
+    def test_mtime_format_uses_the_files_modification_time(self) -> None:
+        self.ledger.write_text("anything at all", encoding="utf-8")
+        result = deadmans.check_task(
+            self.task(),
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=dt.timezone.utc,
+        )
+        self.assertEqual(result.state, "FRESH")
+        self.assertLess(result.age_hours, 1.0)
+
+
+class TestArtefactConfig(TempDirCase):
+    def config(self, artefact) -> deadmans.Config:
+        path = self.tmp_path / "deadmans.json"
+        task = {
+            "name": "t",
+            "max_age_hours": 24,
+            "sentinel": "OK",
+            "artefact": artefact,
+        }
+        path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+        return deadmans.load_config(path)
+
+    def test_absent_by_default(self) -> None:
+        path = self.tmp_path / "deadmans.json"
+        path.write_text(
+            json.dumps(
+                {"tasks": [{"name": "t", "max_age_hours": 1, "sentinel": "OK"}]}
+            ),
+            encoding="utf-8",
+        )
+        self.assertIsNone(deadmans.load_config(path).tasks["t"].artefact)
+
+    def test_relative_path_resolves_against_the_config_directory(self) -> None:
+        task = self.config({"path": "state/out.jsonl", "format": "jsonl"}).tasks["t"]
+        self.assertEqual(task.artefact.path, self.tmp_path / "state" / "out.jsonl")
+
+    def test_absolute_path_is_kept(self) -> None:
+        absolute = (self.tmp_path / "out.jsonl").resolve()
+        task = self.config({"path": str(absolute)}).tasks["t"]
+        self.assertEqual(task.artefact.path, absolute)
+
+    def test_defaults_to_mtime_and_ts(self) -> None:
+        task = self.config({"path": "out.json"}).tasks["t"]
+        self.assertEqual(task.artefact.format, "mtime")
+        self.assertEqual(task.artefact.timestamp_field, "ts")
+        self.assertEqual(task.artefact.match, ())
+
+    def test_non_object_artefact_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config("out.jsonl")
+
+    def test_missing_path_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"format": "jsonl"})
+
+    def test_unknown_format_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"path": "out.jsonl", "format": "sqlite"})
+
+    def test_empty_timestamp_field_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"path": "o.jsonl", "format": "jsonl", "timestamp_field": ""})
+
+    def test_match_on_a_non_jsonl_artefact_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"path": "out.txt", "match": {"a": "b"}})
+
+    def test_bad_regex_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"path": "o.jsonl", "format": "jsonl", "match": {"a": "("}})
+
+    def test_non_string_regex_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config({"path": "o.jsonl", "format": "jsonl", "match": {"a": 7}})
+
+
 class TestCLI(TempDirCase):
     def write_config(self, obj: dict) -> Path:
         path = self.tmp_path / "deadmans.json"

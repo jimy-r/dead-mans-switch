@@ -64,6 +64,7 @@ Keys inside each task object.
 | `start_sentinel` | Optional string the job writes when it *begins*, so a run that starts and never finishes reports `HUNG` rather than `NO_SENTINEL` | none |
 | `max_runtime_hours` | How long a started run may go without finishing before it counts as hung. Needs `start_sentinel` | none |
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
+| `artefact` | Optional second freshness signal keyed to what the job *produces* rather than to its log, see below | none |
 
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
 
@@ -80,6 +81,32 @@ One caveat on `local`: the host offset is read once per run, so a config left on
 Not every tracked task runs on a fixed clock. Some get invoked by hand, or by an agent, on an irregular cadence. A periodic audit, a cleanup pass, something run when someone gets to it rather than on a schedule. For those, a missing log on day one is not a finding. It just means nobody has run it yet.
 
 Set `manual: true` for those tasks. A manual task with no log at all reports `MANUAL_OK`, not `NEVER_RAN`. After that first run, the same staleness window applies as any other task. `manual` only changes what "no log yet" means, not what "an old log" means.
+
+## Checking the output instead of the log
+
+A log line only exists if the job ran through whatever wrapper writes the log. Run the same job another way and the log stays where it was while the real work happens. This is not hypothetical: the lane this tool came from reported CRITICAL for ten days because the task had moved to a different invocation path that wrote no log, while the thing it produces was being updated the whole time. A permanent false-stale trains you to ignore the switch, which is the one outcome worse than not having it.
+
+Point `artefact` at what the job actually produces and that signal counts too.
+
+```json
+{
+  "name": "weekly-audit",
+  "max_age_hours": 192,
+  "sentinel": "WEEKLY_AUDIT_OK",
+  "artefact": {
+    "path": "state/findings.jsonl",
+    "format": "jsonl",
+    "timestamp_field": "ts",
+    "match": { "source": "^weekly-audit-\\d{4}" }
+  }
+}
+```
+
+`format: "mtime"` (the default) takes the file's modification time, which is enough for a report, an export, a rendered page. `format: "jsonl"` reads a newline-delimited JSON file and takes the newest `timestamp_field` value across its records.
+
+`match` is what keeps `jsonl` honest. Each key names a field and each value is a regex the field must match, so only records the tracked job writes are counted. Without it any append to a shared file reports the lane fresh, and a false `FRESH` on a dead-man's switch is worse than the stale it replaces.
+
+When the artefact is the newer of the two signals it decides the state, and the older log's sentinel is not scored, because the artefact already shows the job produced its output. When the log is newer, nothing changes. A relative `path` resolves against the config file's directory, and an artefact file that does not exist yet is simply no signal rather than an error.
 
 ## Jobs that start and never finish
 

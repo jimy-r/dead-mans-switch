@@ -136,6 +136,22 @@ def as_aware(value: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=tz)
 
 
+class Artefact(NamedTuple):
+    """A second freshness signal, keyed to what the job produces.
+
+    A log line only exists if the job ran through whatever wrapper writes the
+    log. Invoke the same job another way -- by hand, from a different host,
+    through an agent rather than its cron entry -- and the log stays where it
+    was while the real work happens, so the switch reports a permanent
+    false-stale on a task that is running fine.
+    """
+
+    path: Path
+    format: str
+    timestamp_field: str
+    match: tuple[tuple[str, re.Pattern[str]], ...]
+
+
 class Task(NamedTuple):
     name: str
     max_age_hours: float
@@ -144,6 +160,7 @@ class Task(NamedTuple):
     manual: bool
     start_sentinel: str | None = None
     max_runtime_hours: float | None = None
+    artefact: Artefact | None = None
 
 
 class Status(NamedTuple):
@@ -191,6 +208,109 @@ def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
         else:
             regex_parts.append(re.escape(part))
     return re.compile("^" + "".join(regex_parts) + "$")
+
+
+ARTEFACT_FORMATS = ("mtime", "jsonl")
+
+
+def parse_artefact(entry: Any, base: Path, where: str) -> Artefact:
+    """Validate one task's `artefact` object into an Artefact."""
+    if not isinstance(entry, dict):
+        raise ConfigError(f"{where}: artefact must be an object")
+
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ConfigError(f"{where}: artefact needs a non-empty path")
+    artefact_path = Path(raw_path)
+    if not artefact_path.is_absolute():
+        artefact_path = base / artefact_path
+
+    fmt = entry.get("format", "mtime")
+    if fmt not in ARTEFACT_FORMATS:
+        raise ConfigError(
+            f"{where}: artefact format must be one of {', '.join(ARTEFACT_FORMATS)}"
+        )
+
+    field = entry.get("timestamp_field", "ts")
+    if not isinstance(field, str) or not field:
+        raise ConfigError(
+            f"{where}: artefact timestamp_field must be a non-empty string"
+        )
+
+    raw_match = entry.get("match", {})
+    if not isinstance(raw_match, dict):
+        raise ConfigError(f"{where}: artefact match must be an object")
+    if raw_match and fmt != "jsonl":
+        raise ConfigError(f"{where}: artefact match only applies to the jsonl format")
+    match: list[tuple[str, re.Pattern[str]]] = []
+    for key, pattern in raw_match.items():
+        if not isinstance(pattern, str):
+            raise ConfigError(f"{where}: artefact match {key!r} must be a regex string")
+        try:
+            match.append((key, re.compile(pattern)))
+        except re.error as exc:
+            raise ConfigError(
+                f"{where}: artefact match {key!r} is not a valid regex: {exc}"
+            ) from exc
+
+    return Artefact(
+        path=artefact_path,
+        format=fmt,
+        timestamp_field=field,
+        match=tuple(match),
+    )
+
+
+def latest_artefact_time(artefact: Artefact, tz: dt.tzinfo) -> dt.datetime | None:
+    """When the artefact last changed, or None if it carries no usable signal.
+
+    A missing file is not an error. It means this task has produced nothing
+    yet, and the log-based path decides what that is worth.
+    """
+    if not artefact.path.is_file():
+        return None
+
+    if artefact.format == "mtime":
+        try:
+            return dt.datetime.fromtimestamp(artefact.path.stat().st_mtime, tz)
+        except OSError:
+            return None
+
+    try:
+        text = artefact.path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    newest: dt.datetime | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        # Matching on the record, not merely on the file changing, is what
+        # keeps an unrelated write from reporting the lane fresh. A false
+        # FRESH on a dead-man's switch is worse than the stale it replaces.
+        if any(
+            not pattern.search(str(record.get(key, "")))
+            for key, pattern in artefact.match
+        ):
+            continue
+        stamp = record.get(artefact.timestamp_field)
+        if not isinstance(stamp, str):
+            continue
+        try:
+            when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        when = as_aware(when, tz)
+        if newest is None or when > newest:
+            newest = when
+    return newest
 
 
 def load_config(path: Path) -> Config:
@@ -295,6 +415,15 @@ def load_config(path: Path) -> Config:
                 )
             max_runtime_hours = float(max_runtime_hours)
 
+        raw_artefact = entry.get("artefact")
+        artefact = (
+            None
+            if raw_artefact is None
+            else parse_artefact(
+                raw_artefact, path.resolve().parent, f"{path}: task {name!r}"
+            )
+        )
+
         tasks[name] = Task(
             name=name,
             max_age_hours=float(max_age_hours),
@@ -303,6 +432,7 @@ def load_config(path: Path) -> Config:
             manual=manual,
             start_sentinel=start_sentinel,
             max_runtime_hours=max_runtime_hours,
+            artefact=artefact,
         )
 
     return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
@@ -375,14 +505,43 @@ def check_task(
     # same zone the log stamps are read in, so read it that way rather than
     # raising on the aware/naive subtraction below.
     now = as_aware(now, tz) if now else dt.datetime.now(tz)
+
+    artefact_time = (
+        latest_artefact_time(task.artefact, tz) if task.artefact is not None else None
+    )
+
+    def from_artefact(when: dt.datetime, note: str) -> Status:
+        age = (now - when).total_seconds() / 3600.0
+        label = task.artefact.path.name
+        if age > task.max_age_hours:
+            return Status(
+                task.name,
+                "STALE",
+                when,
+                age,
+                f"newest {label} record is {age:.1f}h old "
+                f"(max {task.max_age_hours:.1f}h)",
+            )
+        return Status(
+            task.name, "FRESH", when, age, f"{label} updated {age:.1f}h ago; {note}"
+        )
+
     log = latest_log(task.name, log_dir, log_pattern)
     if log is None:
+        if artefact_time is not None:
+            return from_artefact(artefact_time, "no log file matches pattern")
         if task.manual:
             return Status(task.name, "MANUAL_OK", None, None, "manual task; no log yet")
         return Status(task.name, "NEVER_RAN", None, None, "no log file matches pattern")
 
     log_time = parse_log_time(log, task.name, log_pattern, tz)
     age_hours = (now - log_time).total_seconds() / 3600.0 if log_time else None
+
+    # When the artefact is the newer signal, it is also the evidence of
+    # success -- the job produced its output. Scoring an older log's sentinel
+    # at that point reports on a run the artefact has already superseded.
+    if artefact_time is not None and (log_time is None or artefact_time > log_time):
+        return from_artefact(artefact_time, "newer than the last log")
 
     try:
         body = log.read_text(encoding="utf-8", errors="replace")
@@ -618,6 +777,24 @@ def cmd_selftest() -> int:
             "never ran",
             Task("never-ran", 24.0, "OK_SENTINEL", None, False),
             "NEVER_RAN",
+        )
+
+        ledger = Path(tmp) / "artefact.jsonl"
+        ledger.write_text(
+            json.dumps({"ts": (now - dt.timedelta(hours=2)).isoformat()}) + "\n",
+            encoding="utf-8",
+        )
+        expect(
+            "no log, but the artefact is fresh",
+            Task(
+                "artefact-case",
+                24.0,
+                "OK_SENTINEL",
+                None,
+                False,
+                artefact=Artefact(ledger, "jsonl", "ts", ()),
+            ),
+            "FRESH",
         )
         expect(
             "manual, no log",
