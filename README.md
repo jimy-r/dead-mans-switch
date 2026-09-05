@@ -18,6 +18,7 @@ Each job you track writes a plain success string (a sentinel) into its own log f
 - the most recent log is older than its configured window
 - the most recent log has no success sentinel
 - the most recent log carries a failure sentinel instead
+- the most recent log shows the job starting but never finishing
 
 The exit code inverts what you would expect from a linter. 0 means every tracked task is fresh. 1 means at least one needs attention. That makes `deadmans.py check` a one-line addition to a cron job or a CI pipeline.
 
@@ -60,6 +61,8 @@ Keys inside each task object.
 | `max_age_hours` | How old the most recent log can be before it counts as stale | required |
 | `sentinel` | Success string to look for in the most recent log | required |
 | `failure_sentinel` | Optional string that marks an explicit failure | none |
+| `start_sentinel` | Optional string the job writes when it *begins*, so a run that starts and never finishes reports `HUNG` rather than `NO_SENTINEL` | none |
+| `max_runtime_hours` | How long a started run may go without finishing before it counts as hung. Needs `start_sentinel` | none |
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
 
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
@@ -78,9 +81,29 @@ Not every tracked task runs on a fixed clock. Some get invoked by hand, or by an
 
 Set `manual: true` for those tasks. A manual task with no log at all reports `MANUAL_OK`, not `NEVER_RAN`. After that first run, the same staleness window applies as any other task. `manual` only changes what "no log yet" means, not what "an old log" means.
 
+## Jobs that start and never finish
+
+A success sentinel tells you a run finished. It cannot tell you whether a run that produced no sentinel never started, or started and wedged halfway. Both report `NO_SENTINEL`, and those are different problems with different fixes: a scheduler that skipped the job, versus a job that hangs on something.
+
+Have the job write a `start_sentinel` line as its first act, and the two split apart. A log carrying the start string but neither a success nor a failure string reports `HUNG` instead, and the detail line says how long ago it began.
+
+```json
+{
+  "name": "nightly-report",
+  "max_age_hours": 30,
+  "sentinel": "NIGHTLY_REPORT_OK",
+  "start_sentinel": "NIGHTLY_REPORT_START",
+  "max_runtime_hours": 2
+}
+```
+
+`max_runtime_hours` is the allowance a run gets before an unfinished start counts as hung. Inside it the task reports `RUNNING`, which passes, so checking while a long job is genuinely mid-flight doesn't raise a false alarm. Leave it out and any unfinished start is `HUNG` immediately, which is fine when nothing you track runs long enough to overlap a check.
+
+Staleness still wins. A started-but-unfinished log old enough to breach `max_age_hours` reports `STALE`, because at that point the age is the more urgent fact.
+
 ## What "fresh" actually means
 
-`check` reports one of these states per task. `FRESH`, `STALE`, `FAILED`, `NO_SENTINEL`, `NEVER_RAN`, `MANUAL_OK`, or `LOG_UNREADABLE` if the log file itself cannot be read. Only `FRESH` and `MANUAL_OK` pass.
+`check` reports one of these states per task. `FRESH`, `STALE`, `FAILED`, `HUNG`, `RUNNING`, `NO_SENTINEL`, `NEVER_RAN`, `MANUAL_OK`, or `LOG_UNREADABLE` if the log file itself cannot be read. `FRESH`, `RUNNING` and `MANUAL_OK` pass; everything else is a finding.
 
 Staleness is checked first. A log old enough to breach its window is `STALE` regardless of what it contains. Inside the window, being recent is not automatically a pass. A log without the success sentinel still fails the check, whether that is because the job crashed and left a `failure_sentinel` behind, or because it exited without writing anything conclusive at all.
 

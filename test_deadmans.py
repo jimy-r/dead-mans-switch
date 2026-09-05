@@ -575,6 +575,116 @@ class TestSentinelAnchoring(TempDirCase):
         self.assertEqual(result.state, "FRESH")
 
 
+class TestStartSentinel(TempDirCase):
+    """A job that opens its log and never reaches the success string is hung,
+    not merely sentinel-less."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0)
+        self.task = deadmans.Task(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel="FAIL_SENTINEL",
+            manual=False,
+            start_sentinel="START_SENTINEL",
+            max_runtime_hours=1.0,
+        )
+
+    def check(self, body: str, stamp: str = "1000", **overrides) -> deadmans.Status:
+        write_log(self.log_dir, f"scheduled_2026-01-15-{stamp}.log", body)
+        task = self.task._replace(**overrides) if overrides else self.task
+        return deadmans.check_task(
+            task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+
+    def test_started_past_the_allowance_is_hung(self) -> None:
+        result = self.check("START_SENTINEL\nworking...\n")
+        self.assertEqual(result.state, "HUNG")
+        self.assertIn("2.0h ago", result.detail)
+
+    def test_started_inside_the_allowance_is_running(self) -> None:
+        result = self.check("START_SENTINEL\nworking...\n", stamp="1145")
+        self.assertEqual(result.state, "RUNNING")
+
+    def test_running_is_not_a_finding(self) -> None:
+        self.assertIn("RUNNING", deadmans.OK_STATES)
+
+    def test_hung_is_a_finding(self) -> None:
+        self.assertNotIn("HUNG", deadmans.OK_STATES)
+
+    def test_start_then_success_is_still_fresh(self) -> None:
+        self.assertEqual(self.check("START_SENTINEL\nOK_SENTINEL\n").state, "FRESH")
+
+    def test_start_then_failure_is_still_failed(self) -> None:
+        self.assertEqual(self.check("START_SENTINEL\nFAIL_SENTINEL\n").state, "FAILED")
+
+    def test_no_start_sentinel_in_the_log_is_still_no_sentinel(self) -> None:
+        self.assertEqual(self.check("nothing conclusive here\n").state, "NO_SENTINEL")
+
+    def test_unconfigured_start_sentinel_leaves_behaviour_unchanged(self) -> None:
+        result = self.check(
+            "START_SENTINEL\nworking...\n", start_sentinel=None, max_runtime_hours=None
+        )
+        self.assertEqual(result.state, "NO_SENTINEL")
+
+    def test_without_an_allowance_any_unfinished_start_is_hung(self) -> None:
+        result = self.check(
+            "START_SENTINEL\nworking...\n", stamp="1155", max_runtime_hours=None
+        )
+        self.assertEqual(result.state, "HUNG")
+
+    def test_stale_still_wins_over_hung(self) -> None:
+        write_log(
+            self.log_dir, "scheduled_2026-01-13-1000.log", "START_SENTINEL\nworking\n"
+        )
+        result = deadmans.check_task(
+            self.task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+        self.assertEqual(result.state, "STALE")
+
+    def test_mid_sentence_start_mention_does_not_count_as_a_start(self) -> None:
+        result = self.check("grepping for START_SENTINEL in yesterday's log\n")
+        self.assertEqual(result.state, "NO_SENTINEL")
+
+
+class TestStartSentinelConfig(TempDirCase):
+    def config(self, **task_keys) -> deadmans.Config:
+        path = self.tmp_path / "deadmans.json"
+        task = {"name": "t", "max_age_hours": 24, "sentinel": "OK"}
+        task.update(task_keys)
+        path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+        return deadmans.load_config(path)
+
+    def test_defaults_to_absent(self) -> None:
+        task = self.config().tasks["t"]
+        self.assertIsNone(task.start_sentinel)
+        self.assertIsNone(task.max_runtime_hours)
+
+    def test_both_keys_load(self) -> None:
+        task = self.config(start_sentinel="GO", max_runtime_hours=2).tasks["t"]
+        self.assertEqual(task.start_sentinel, "GO")
+        self.assertEqual(task.max_runtime_hours, 2.0)
+
+    def test_empty_start_sentinel_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config(start_sentinel="")
+
+    def test_runtime_without_a_start_sentinel_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config(max_runtime_hours=2)
+
+    def test_non_positive_runtime_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config(start_sentinel="GO", max_runtime_hours=0)
+
+    def test_boolean_runtime_raises(self) -> None:
+        with self.assertRaises(deadmans.ConfigError):
+            self.config(start_sentinel="GO", max_runtime_hours=True)
+
+
 class TestCLI(TempDirCase):
     def write_config(self, obj: dict) -> Path:
         path = self.tmp_path / "deadmans.json"

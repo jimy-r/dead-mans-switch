@@ -55,8 +55,8 @@ _OFFSET_RE = re.compile(r"^(?P<sign>[+-])(?P<hh>\d{2}):?(?P<mm>\d{2})$")
 _SENTINEL_DECORATION = r"[\s*_`]*"
 
 # States that mean "this task is not a finding". Everything else -- STALE,
-# FAILED, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
-OK_STATES = frozenset({"FRESH", "MANUAL_OK"})
+# FAILED, HUNG, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
+OK_STATES = frozenset({"FRESH", "MANUAL_OK", "RUNNING"})
 
 EXAMPLE_CONFIG: dict[str, Any] = {
     "log_dir": "logs",
@@ -68,6 +68,8 @@ EXAMPLE_CONFIG: dict[str, Any] = {
             "max_age_hours": 30,
             "sentinel": "NIGHTLY_REPORT_OK",
             "failure_sentinel": "NIGHTLY_REPORT_FAILED",
+            "start_sentinel": "NIGHTLY_REPORT_START",
+            "max_runtime_hours": 2,
             "manual": False,
         },
         {
@@ -140,6 +142,8 @@ class Task(NamedTuple):
     sentinel: str
     failure_sentinel: str | None
     manual: bool
+    start_sentinel: str | None = None
+    max_runtime_hours: float | None = None
 
 
 class Status(NamedTuple):
@@ -263,12 +267,42 @@ def load_config(path: Path) -> Config:
         if not isinstance(manual, bool):
             raise ConfigError(f"{path}: task {name!r} manual must be true or false")
 
+        start_sentinel = entry.get("start_sentinel")
+        if start_sentinel is not None and (
+            not isinstance(start_sentinel, str) or not start_sentinel
+        ):
+            raise ConfigError(
+                f"{path}: task {name!r} start_sentinel must be a non-empty "
+                "string if present"
+            )
+
+        max_runtime_hours = entry.get("max_runtime_hours")
+        if max_runtime_hours is not None:
+            if start_sentinel is None:
+                raise ConfigError(
+                    f"{path}: task {name!r} sets max_runtime_hours but no "
+                    "start_sentinel, so nothing marks when the run began"
+                )
+            if not isinstance(max_runtime_hours, (int, float)) or isinstance(
+                max_runtime_hours, bool
+            ):
+                raise ConfigError(
+                    f"{path}: task {name!r} max_runtime_hours must be numeric"
+                )
+            if max_runtime_hours <= 0:
+                raise ConfigError(
+                    f"{path}: task {name!r} max_runtime_hours must be positive"
+                )
+            max_runtime_hours = float(max_runtime_hours)
+
         tasks[name] = Task(
             name=name,
             max_age_hours=float(max_age_hours),
             sentinel=sentinel,
             failure_sentinel=failure_sentinel,
             manual=manual,
+            start_sentinel=start_sentinel,
+            max_runtime_hours=max_runtime_hours,
         )
 
     return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
@@ -383,6 +417,35 @@ def check_task(
             age_hours,
             "failure sentinel present, no success sentinel",
         )
+    # A log that opened but never reached its success string is a different
+    # animal from one that says nothing at all: the job fired, then died or
+    # wedged partway. Without a start sentinel both look like NO_SENTINEL,
+    # and the operator cannot tell "the scheduler skipped it" from "it hung".
+    if (
+        not success
+        and task.start_sentinel
+        and sentinel_matches(task.start_sentinel, body)
+    ):
+        grace = task.max_runtime_hours
+        if grace is not None and age_hours is not None and age_hours <= grace:
+            return Status(
+                task.name,
+                "RUNNING",
+                log_time,
+                age_hours,
+                f"started {age_hours:.1f}h ago, inside the {grace:.1f}h allowance",
+            )
+        started = (
+            f"{age_hours:.1f}h ago" if age_hours is not None else "at an unknown time"
+        )
+        return Status(
+            task.name,
+            "HUNG",
+            log_time,
+            age_hours,
+            f"started {started}, no success or failure sentinel since",
+        )
+
     if not success:
         return Status(
             task.name,
@@ -514,6 +577,42 @@ def cmd_selftest() -> int:
             "no-sentinel-case", now - dt.timedelta(hours=1), "hello, no sentinel here\n"
         )
         expect("sentinel-less log", scenario("no-sentinel-case"), "NO_SENTINEL")
+
+        write_log(
+            "hung-case", now - dt.timedelta(hours=3), "START_SENTINEL\nworking...\n"
+        )
+        expect(
+            "started but never finished",
+            Task(
+                "hung-case",
+                24.0,
+                "OK_SENTINEL",
+                "FAIL_SENTINEL",
+                False,
+                start_sentinel="START_SENTINEL",
+                max_runtime_hours=1.0,
+            ),
+            "HUNG",
+        )
+
+        write_log(
+            "running-case",
+            now - dt.timedelta(minutes=10),
+            "START_SENTINEL\nworking...\n",
+        )
+        expect(
+            "started, still inside its runtime allowance",
+            Task(
+                "running-case",
+                24.0,
+                "OK_SENTINEL",
+                "FAIL_SENTINEL",
+                False,
+                start_sentinel="START_SENTINEL",
+                max_runtime_hours=1.0,
+            ),
+            "RUNNING",
+        )
 
         expect(
             "never ran",
