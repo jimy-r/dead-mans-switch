@@ -49,6 +49,11 @@ DEFAULT_TIMEZONE = "local"
 # hours fresher than it is. Both sides are made aware instead.
 _OFFSET_RE = re.compile(r"^(?P<sign>[+-])(?P<hh>\d{2}):?(?P<mm>\d{2})$")
 
+# Decoration a sentinel picks up on its way into a log: indentation from a
+# shell wrapper, backticks or asterisks from anything that formats markdown.
+# Tolerated in front of the sentinel; the sentinel still has to open the line.
+_SENTINEL_DECORATION = r"[\s*_`]*"
+
 # States that mean "this task is not a finding". Everything else -- STALE,
 # FAILED, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
 OK_STATES = frozenset({"FRESH", "MANUAL_OK"})
@@ -304,6 +309,26 @@ def parse_log_time(
         return None
 
 
+def sentinel_matches(sentinel: str, body: str) -> bool:
+    """True when `sentinel` opens a line of `body`.
+
+    A bare ``sentinel in body`` substring test passes a log that merely
+    mentions the string: a run that quotes its own last failure, a summary
+    line naming the sentinel it was looking for, a config file pasted into
+    the output. That is a false FRESH on a dead-man's switch, which is worse
+    than the false finding it avoids. Anchoring to the start of a line keeps
+    the mention out while still accepting the decoration a real sentinel line
+    picks up in practice.
+    """
+    head = body.lstrip("﻿")  # some producers open the file with a BOM
+    # Stop a sentinel matching a longer token that starts with it, but only
+    # when it ends in a word character -- \b after "OK!" would never match.
+    tail = r"\b" if sentinel[-1:].isalnum() or sentinel.endswith("_") else ""
+    return bool(
+        re.search(rf"^{_SENTINEL_DECORATION}{re.escape(sentinel)}{tail}", head, re.M)
+    )
+
+
 def check_task(
     task: Task,
     log_dir: Path,
@@ -332,8 +357,10 @@ def check_task(
             task.name, "LOG_UNREADABLE", log_time, age_hours, f"read error: {exc}"
         )
 
-    success = task.sentinel in body
-    failure = task.failure_sentinel is not None and task.failure_sentinel in body
+    success = sentinel_matches(task.sentinel, body)
+    failure = task.failure_sentinel is not None and sentinel_matches(
+        task.failure_sentinel, body
+    )
 
     # Staleness is checked first and short-circuits: a log old enough to
     # breach the window is a finding regardless of what it contains. Within

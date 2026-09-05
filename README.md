@@ -12,7 +12,7 @@ Catching more failure modes does not fix this. Checking for success directly doe
 
 ## How it works
 
-Each job you track writes a plain success string (a sentinel) into its own log file when it finishes. `deadmans.py` scans your log directory for each task's most recent log, inside a staleness window you configure, and checks for that sentinel. A task is a finding if:
+Each job you track writes a plain success string (a sentinel) into its own log file when it finishes. `deadmans.py` scans your log directory for each task's most recent log, inside a staleness window you configure, and checks for that sentinel on a line of its own. A task is a finding if:
 
 - no log exists yet, and the task is not flagged manual
 - the most recent log is older than its configured window
@@ -83,6 +83,12 @@ Set `manual: true` for those tasks. A manual task with no log at all reports `MA
 `check` reports one of these states per task. `FRESH`, `STALE`, `FAILED`, `NO_SENTINEL`, `NEVER_RAN`, `MANUAL_OK`, or `LOG_UNREADABLE` if the log file itself cannot be read. Only `FRESH` and `MANUAL_OK` pass.
 
 Staleness is checked first. A log old enough to breach its window is `STALE` regardless of what it contains. Inside the window, being recent is not automatically a pass. A log without the success sentinel still fails the check, whether that is because the job crashed and left a `failure_sentinel` behind, or because it exited without writing anything conclusive at all.
+
+## What counts as writing the sentinel
+
+The sentinel has to open a line. A log that only mentions the string somewhere in a sentence does not pass, because that mention is exactly what a run quoting its own last failure looks like, or a summary line naming the sentinel it went looking for. Treating a mention as a success is a false `FRESH` on a dead-man's switch, which is a worse failure than the false finding it would avoid.
+
+Leading whitespace, backticks, asterisks and underscores in front of the sentinel are fine, so a log line written as `` `MY_JOB_OK` `` or `**MY_JOB_OK**` still counts. A leading byte order mark on the file does not hide the first line. A sentinel of `MY_JOB_OK` does not match `MY_JOB_OK_PENDING`.
 
 ## CLI
 

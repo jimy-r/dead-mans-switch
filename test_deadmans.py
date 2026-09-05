@@ -515,6 +515,66 @@ class TestCheckTask(TempDirCase):
         self.assertEqual(result.state, "STALE")
 
 
+class TestSentinelAnchoring(TempDirCase):
+    """A log that merely mentions the sentinel is not a log that reports it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0)
+        self.task = deadmans.Task(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel="FAIL_SENTINEL",
+            manual=False,
+        )
+
+    def check(self, body: str) -> deadmans.Status:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", body)
+        return deadmans.check_task(
+            self.task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+
+    def test_mid_sentence_mention_is_not_a_success(self) -> None:
+        body = "checked the log and found no OK_SENTINEL anywhere\n"
+        self.assertEqual(self.check(body).state, "NO_SENTINEL")
+
+    def test_mid_sentence_mention_of_the_failure_string_is_not_a_failure(self) -> None:
+        body = "the previous run left FAIL_SENTINEL behind; this one recovered\n"
+        self.assertEqual(self.check(body).state, "NO_SENTINEL")
+
+    def test_sentinel_opening_its_own_line_passes(self) -> None:
+        self.assertEqual(self.check("run started\nOK_SENTINEL\n").state, "FRESH")
+
+    def test_markdown_and_indent_decoration_is_tolerated(self) -> None:
+        for line in (
+            "`OK_SENTINEL`",
+            "  OK_SENTINEL",
+            "**OK_SENTINEL**",
+            "_OK_SENTINEL",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.check(f"header\n{line}\n").state, "FRESH")
+
+    def test_leading_byte_order_mark_does_not_hide_the_sentinel(self) -> None:
+        self.assertEqual(self.check("﻿OK_SENTINEL\n").state, "FRESH")
+
+    def test_longer_token_starting_with_the_sentinel_does_not_match(self) -> None:
+        self.assertEqual(self.check("OK_SENTINEL_PENDING\n").state, "NO_SENTINEL")
+
+    def test_failure_sentinel_on_its_own_line_still_fails(self) -> None:
+        self.assertEqual(self.check("boom\nFAIL_SENTINEL\n").state, "FAILED")
+
+    def test_non_word_final_character_still_matches(self) -> None:
+        task = self.task._replace(sentinel="DONE!")
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "DONE!\n")
+        result = deadmans.check_task(
+            task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+        self.assertEqual(result.state, "FRESH")
+
+
 class TestCLI(TempDirCase):
     def write_config(self, obj: dict) -> Path:
         path = self.tmp_path / "deadmans.json"
