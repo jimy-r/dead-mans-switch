@@ -10,13 +10,27 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      dist-sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install build
       - run: python -m build
+      # `python -m build` executes this repo's own build backend, so the artifact is
+      # only as trustworthy as the job that produced it. Carry a digest across the job
+      # boundary so publish can prove it got that exact artifact back.
+      - id: digest
+        run: |
+          sha256sum dist/* | sort -k2 > dist.sha256
+          echo "sha256<<EOF" >> "$GITHUB_OUTPUT"
+          cat dist.sha256 >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cat dist.sha256
       - uses: actions/upload-artifact@v7
         with:
           name: dist
@@ -33,4 +47,15 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: Verify artifact digest matches the build job
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.dist-sha256 }}
+        run: |
+          printf '%s\n' "$EXPECTED_SHA256" > expected.sha256
+          sha256sum dist/* | sort -k2 > actual.sha256
+          if ! diff -u expected.sha256 actual.sha256; then
+            echo "::error::dist/ does not match the digest emitted by the build job; refusing to publish"
+            exit 1
+          fi
+          echo "artifact digest verified"
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
