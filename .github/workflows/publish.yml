@@ -1,8 +1,8 @@
 name: publish
 
+# PyPI publishing is a deliberate manual act (v0.2.0 shipped as a GitHub release only, 2026-09-13).
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
