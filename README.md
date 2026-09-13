@@ -24,7 +24,7 @@ The exit code inverts what you would expect from a linter. 0 means every tracked
 
 ## Install
 
-Install from source until v0.2.0 lands on PyPI:
+Install from source.
 
 ```bash
 git clone https://github.com/jimy-r/dead-mans-switch.git
@@ -171,6 +171,10 @@ python deadmans.py selftest
 ## Origin
 
 This is pattern 3, ["Make silent failure loud (the dead-man's switch)"](https://github.com/jimy-r/agent-workspace-architecture/blob/main/PATTERNS.md?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch#3-make-silent-failure-loud-the-dead-mans-switch), from the [agent-workspace-architecture](https://github.com/jimy-r/agent-workspace-architecture?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch) reference, extracted into a standalone tool. It's one of six repos published from that same workspace; the [interactive tour](https://jimy-r.github.io/agent-workspace-architecture/?utm_source=github&utm_medium=repo&utm_campaign=dead-mans-switch) walks the rest.
+
+## Contributing
+
+Issues and pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the setup, the test gate, and the one rule that is not negotiable.
 
 ## License
 
