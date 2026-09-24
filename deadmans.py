@@ -261,20 +261,35 @@ def parse_artefact(entry: Any, base: Path, where: str) -> Artefact:
     )
 
 
-def latest_artefact_time(artefact: Artefact, tz: dt.tzinfo) -> dt.datetime | None:
+def latest_artefact_time(
+    artefact: Artefact,
+    tz: dt.tzinfo,
+    not_after: dt.datetime | None = None,
+    skipped: list[dt.datetime] | None = None,
+) -> dt.datetime | None:
     """When the artefact last changed, or None if it carries no usable signal.
 
     A missing file is not an error. It means this task has produced nothing
     yet, and the log-based path decides what that is worth.
+
+    `not_after` (751227da) rejects a record stamped further ahead of the
+    clock than that instant as clock skew rather than reading it as a fresh
+    run that has not happened yet; each rejected stamp is appended to
+    `skipped` when the caller wants to report on it.
     """
     if not artefact.path.is_file():
         return None
 
     if artefact.format == "mtime":
         try:
-            return dt.datetime.fromtimestamp(artefact.path.stat().st_mtime, tz)
+            when = dt.datetime.fromtimestamp(artefact.path.stat().st_mtime, tz)
         except OSError:
             return None
+        if not_after is not None and when > not_after:
+            if skipped is not None:
+                skipped.append(when)
+            return None
+        return when
 
     try:
         text = artefact.path.read_text(encoding="utf-8", errors="replace")
@@ -308,6 +323,10 @@ def latest_artefact_time(artefact: Artefact, tz: dt.tzinfo) -> dt.datetime | Non
         except ValueError:
             continue
         when = as_aware(when, tz)
+        if not_after is not None and when > not_after:
+            if skipped is not None:
+                skipped.append(when)
+            continue
         if newest is None or when > newest:
             newest = when
     return newest
@@ -493,6 +512,44 @@ def sentinel_matches(sentinel: str, body: str) -> bool:
     )
 
 
+# Artefact overrides the log only when it postdates that run's END by more
+# than this margin: a record the SAME run emits partway through must not
+# outrank that run's own FAILED or HUNG verdict (751227da). A record stamped
+# further ahead of the clock than the skew tolerance is never treated as
+# evidence of a run that has not happened yet.
+ARTEFACT_OVERRIDE_MARGIN = dt.timedelta(minutes=10)
+FUTURE_SKEW_TOLERANCE = dt.timedelta(minutes=5)
+
+
+def _logged_run_end(
+    log: Path, log_time: dt.datetime | None, body: str, task: Task, tz: dt.tzinfo
+) -> dt.datetime | None:
+    """When the logged run ENDED, as far as the checker can tell.
+
+    The log filename records when the run STARTED. A record the same run
+    emits partway through is always "newer" than that start stamp, so
+    comparing an artefact against the filename let a run's own emit hide
+    that run's own FAILED or HUNG outcome. The log's mtime -- its last
+    write -- is a much closer proxy for when it ended, once the run has
+    actually finished (its success or failure sentinel is present). A log
+    with neither may still be going, or be wedged, so it counts as running
+    until start + max_runtime_hours rather than ending at its last byte.
+    """
+    try:
+        end = dt.datetime.fromtimestamp(log.stat().st_mtime, tz)
+    except OSError:
+        end = log_time
+    if log_time is not None and (end is None or end < log_time):
+        end = log_time
+    finished = sentinel_matches(task.sentinel, body) or (
+        task.failure_sentinel is not None
+        and sentinel_matches(task.failure_sentinel, body)
+    )
+    if not finished and task.max_runtime_hours is not None and log_time is not None:
+        end = max(end, log_time + dt.timedelta(hours=task.max_runtime_hours))
+    return end
+
+
 def check_task(
     task: Task,
     log_dir: Path,
@@ -506,8 +563,32 @@ def check_task(
     # raising on the aware/naive subtraction below.
     now = as_aware(now, tz) if now else dt.datetime.now(tz)
 
+    skewed: list[dt.datetime] = []
+    status = _check_task(task, log_dir, log_pattern, now, tz, skewed)
+    if skewed:
+        status = status._replace(
+            detail=(
+                f"{status.detail}; ignored {len(skewed)} future-dated record(s), "
+                f"newest {max(skewed):%Y-%m-%d %H:%M} (clock skew)"
+            )
+        )
+    return status
+
+
+def _check_task(
+    task: Task,
+    log_dir: Path,
+    log_pattern: str,
+    now: dt.datetime,
+    tz: dt.tzinfo,
+    skewed: list[dt.datetime],
+) -> Status:
     artefact_time = (
-        latest_artefact_time(task.artefact, tz) if task.artefact is not None else None
+        latest_artefact_time(
+            task.artefact, tz, not_after=now + FUTURE_SKEW_TOLERANCE, skipped=skewed
+        )
+        if task.artefact is not None
+        else None
     )
 
     def from_artefact(when: dt.datetime, note: str) -> Status:
@@ -537,18 +618,24 @@ def check_task(
     log_time = parse_log_time(log, task.name, log_pattern, tz)
     age_hours = (now - log_time).total_seconds() / 3600.0 if log_time else None
 
-    # When the artefact is the newer signal, it is also the evidence of
-    # success -- the job produced its output. Scoring an older log's sentinel
-    # at that point reports on a run the artefact has already superseded.
-    if artefact_time is not None and (log_time is None or artefact_time > log_time):
-        return from_artefact(artefact_time, "newer than the last log")
-
     try:
         body = log.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return Status(
             task.name, "LOG_UNREADABLE", log_time, age_hours, f"read error: {exc}"
         )
+
+    # The artefact overrides the log only once it postdates that run's END
+    # by more than the margin (751227da) -- not merely the log's filename,
+    # which is only when the run STARTED and so cannot tell a same-run emit
+    # apart from a genuinely later, separate invocation.
+    if artefact_time is not None:
+        run_end = _logged_run_end(log, log_time, body, task, tz)
+        if run_end is None or artefact_time > run_end + ARTEFACT_OVERRIDE_MARGIN:
+            ended = f"{run_end:%Y-%m-%d %H:%M}" if run_end else "at an unknown time"
+            return from_artefact(
+                artefact_time, f"newer than the last logged run, which ended {ended}"
+            )
 
     success = sentinel_matches(task.sentinel, body)
     failure = task.failure_sentinel is not None and sentinel_matches(
