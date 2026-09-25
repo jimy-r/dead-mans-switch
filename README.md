@@ -32,10 +32,6 @@ cd dead-mans-switch
 pip install .
 ```
 
-```bash
-pip install dead-mans-switch  # after the first PyPI release
-```
-
 This adds a `dead-mans-switch` command to your PATH. Every example below also works as `dead-mans-switch check` in place of `python deadmans.py check`.
 
 Installing is not required. `deadmans.py` is a single stdlib-only file, so cloning the repo and running `python deadmans.py` works exactly the same, with nothing to add to a scheduling environment beyond the file itself.
