@@ -24,7 +24,7 @@ def write_log(
     if mtime is not None:
         # A tz-aware instant's own .timestamp() is host-timezone-independent,
         # unlike stat()'s default (the real filesystem clock at test time),
-        # which is what a run-end comparison (751227da) needs to be exact.
+        # which is what a run-end comparison needs to be exact.
         stamp = mtime.timestamp()
         os.utime(path, (stamp, stamp))
     return path
@@ -749,7 +749,7 @@ class TestArtefactFreshness(TempDirCase):
         # The log is old enough to breach the window on its own, and it
         # finished (carries the success sentinel) right when its filename
         # says, so pinning its mtime there keeps the run-end comparison
-        # (751227da) exact regardless of the host running this test.
+        # exact regardless of the host running this test.
         write_log(
             self.log_dir,
             "scheduled_2026-01-10-1000.log",
@@ -830,7 +830,7 @@ class TestArtefactFreshness(TempDirCase):
 
 class TestSameRunArtefactPrecedence(TempDirCase):
     """An artefact the SAME run emits must not outrank that run's own FAILED
-    or HUNG verdict (751227da). The old code compared the artefact against
+    or HUNG verdict. The old code compared the artefact against
     the log FILENAME's start stamp, so a record emitted anywhere during a
     run always read as "newer than the log" and hid whatever that run went
     on to record. The fix judges the artefact against when the run ENDED

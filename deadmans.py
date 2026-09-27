@@ -272,7 +272,7 @@ def latest_artefact_time(
     A missing file is not an error. It means this task has produced nothing
     yet, and the log-based path decides what that is worth.
 
-    `not_after` (751227da) rejects a record stamped further ahead of the
+    `not_after` rejects a record stamped further ahead of the
     clock than that instant as clock skew rather than reading it as a fresh
     run that has not happened yet; each rejected stamp is appended to
     `skipped` when the caller wants to report on it.
@@ -514,7 +514,7 @@ def sentinel_matches(sentinel: str, body: str) -> bool:
 
 # Artefact overrides the log only when it postdates that run's END by more
 # than this margin: a record the SAME run emits partway through must not
-# outrank that run's own FAILED or HUNG verdict (751227da). A record stamped
+# outrank that run's own FAILED or HUNG verdict. A record stamped
 # further ahead of the clock than the skew tolerance is never treated as
 # evidence of a run that has not happened yet.
 ARTEFACT_OVERRIDE_MARGIN = dt.timedelta(minutes=10)
@@ -626,7 +626,7 @@ def _check_task(
         )
 
     # The artefact overrides the log only once it postdates that run's END
-    # by more than the margin (751227da) -- not merely the log's filename,
+    # by more than the margin -- not merely the log's filename,
     # which is only when the run STARTED and so cannot tell a same-run emit
     # apart from a genuinely later, separate invocation.
     if artefact_time is not None:
