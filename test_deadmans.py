@@ -6,6 +6,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,10 +15,18 @@ from unittest import mock
 import deadmans
 
 
-def write_log(log_dir: Path, name: str, body: str) -> Path:
+def write_log(
+    log_dir: Path, name: str, body: str, mtime: dt.datetime | None = None
+) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / name
     path.write_text(body, encoding="utf-8")
+    if mtime is not None:
+        # A tz-aware instant's own .timestamp() is host-timezone-independent,
+        # unlike stat()'s default (the real filesystem clock at test time),
+        # which is what a run-end comparison needs to be exact.
+        stamp = mtime.timestamp()
+        os.utime(path, (stamp, stamp))
     return path
 
 
@@ -737,8 +746,16 @@ class TestArtefactFreshness(TempDirCase):
         self.assertEqual(self.check(self.task(format="jsonl")).state, "STALE")
 
     def test_artefact_newer_than_the_log_wins(self) -> None:
-        # The log is old enough to breach the window on its own.
-        write_log(self.log_dir, "scheduled_2026-01-10-1000.log", "OK_SENTINEL\n")
+        # The log is old enough to breach the window on its own, and it
+        # finished (carries the success sentinel) right when its filename
+        # says, so pinning its mtime there keeps the run-end comparison
+        # exact regardless of the host running this test.
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-10-1000.log",
+            "OK_SENTINEL\n",
+            mtime=dt.datetime(2026, 1, 10, 10, 0, tzinfo=dt.timezone.utc),
+        )
         self.write_ledger({"ts": "2026-01-15T09:00:00", "event": "emit"})
         result = self.check(self.task(format="jsonl"))
         self.assertEqual(result.state, "FRESH")
@@ -809,6 +826,111 @@ class TestArtefactFreshness(TempDirCase):
         )
         self.assertEqual(result.state, "FRESH")
         self.assertLess(result.age_hours, 1.0)
+
+
+class TestSameRunArtefactPrecedence(TempDirCase):
+    """An artefact the SAME run emits must not outrank that run's own FAILED
+    or HUNG verdict. The old code compared the artefact against
+    the log FILENAME's start stamp, so a record emitted anywhere during a
+    run always read as "newer than the log" and hid whatever that run went
+    on to record. The fix judges the artefact against when the run ENDED
+    (the log's own mtime, or start + max_runtime_hours while a run with no
+    sentinel yet is still within its allowance), only overrides once the
+    artefact clears that by ARTEFACT_OVERRIDE_MARGIN, and ignores a record
+    stamped more than FUTURE_SKEW_TOLERANCE ahead of the clock outright."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.ledger = self.tmp_path / "emit.jsonl"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+        self.run_start = self.now - dt.timedelta(hours=6)
+
+    def write_ledger(self, *whens: dt.datetime) -> None:
+        self.ledger.write_text(
+            "\n".join(json.dumps({"ts": w.isoformat()}) for w in whens) + "\n",
+            encoding="utf-8",
+        )
+
+    def task(self, **overrides) -> deadmans.Task:
+        artefact = deadmans.parse_artefact(
+            {"path": str(self.ledger), "format": "jsonl"}, self.tmp_path, "test"
+        )
+        fields = dict(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel="FAIL_SENTINEL",
+            manual=False,
+            start_sentinel="START_SENTINEL",
+            max_runtime_hours=5.0,
+            artefact=artefact,
+        )
+        fields.update(overrides)
+        return deadmans.Task(**fields)
+
+    def check(self, task: deadmans.Task | None = None) -> deadmans.Status:
+        return deadmans.check_task(
+            task or self.task(),
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=self.now,
+            tz=dt.timezone.utc,
+        )
+
+    def test_emit_partway_through_a_failed_run_does_not_read_fresh(self) -> None:
+        # Started 6h ago, emitted to its artefact 20min in, then failed 5min
+        # later (the log's mtime -- its last write -- is that failure
+        # instant). The old comparison against the 6h-old filename stamp
+        # read the 20-minute mark as newer than the log and hid the FAILED
+        # verdict entirely.
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-15-0600.log",
+            "START_SENTINEL\nworking\nFAIL_SENTINEL\n",
+            mtime=self.run_start + dt.timedelta(minutes=25),
+        )
+        self.write_ledger(self.run_start + dt.timedelta(minutes=20))
+        self.assertEqual(self.check().state, "FAILED")
+
+    def test_emit_partway_through_a_wedged_run_does_not_read_fresh(self) -> None:
+        # Same shape, but the run never reached a sentinel at all -- it
+        # wrote its start line, emitted once, then wedged. 6h after start is
+        # past the 5h allowance, so the correct verdict is HUNG, not FRESH.
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-15-0600.log",
+            "START_SENTINEL\nworking...\n",
+            mtime=self.run_start + dt.timedelta(minutes=1),
+        )
+        self.write_ledger(self.run_start + dt.timedelta(minutes=20))
+        self.assertEqual(self.check().state, "HUNG")
+
+    def test_future_dated_record_is_ignored_as_clock_skew(self) -> None:
+        # A record stamped 30 days ahead is not evidence of a fresh run --
+        # it is a clock problem -- so with no log at all the task reads as
+        # though the record were not there.
+        self.write_ledger(self.now + dt.timedelta(days=30))
+        task = self.task(start_sentinel=None, max_runtime_hours=None)
+        result = self.check(task)
+        self.assertEqual(result.state, "NEVER_RAN")
+        self.assertIn("clock skew", result.detail)
+
+    def test_a_record_comfortably_past_the_margin_still_overrides(self) -> None:
+        # The margin exists for the SAME run's own emit, not as a general
+        # dead zone: a record from a later, distinct invocation still
+        # overrides once it clears ARTEFACT_OVERRIDE_MARGIN past the run's
+        # end.
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-15-0600.log",
+            "START_SENTINEL\nFAIL_SENTINEL\n",
+            mtime=self.run_start + dt.timedelta(minutes=2),
+        )
+        self.write_ledger(self.run_start + dt.timedelta(minutes=17))
+        result = self.check()
+        self.assertEqual(result.state, "FRESH")
+        self.assertIn("newer than the last logged run", result.detail)
 
 
 class TestArtefactConfig(TempDirCase):
