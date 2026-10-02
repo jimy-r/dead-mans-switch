@@ -4,6 +4,10 @@ Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- `failure_patterns`, an optional per-task list of regular expressions for failures the job reports in words it did not choose, such as an expired token's `API Error: 401`. Each pattern is tried with `re.match` against every log line, so it is anchored to the start of a line. A match marks the run `FAILED` the same way `failure_sentinel` does, and `failure_sentinel` works as before.
+
 ### Fixed
 
 - An artefact record a run writes partway through no longer hides that same run's `FAILED` or `HUNG` result. The artefact is now compared with when the logged run ended rather than with the start stamp in the log's filename, and it overrides the log only once it is more than ten minutes newer than that end. A record stamped more than five minutes in the future is ignored as clock skew (#11).

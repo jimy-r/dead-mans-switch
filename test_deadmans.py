@@ -617,6 +617,74 @@ class TestSentinelAnchoring(TempDirCase):
         self.assertEqual(result.state, "FRESH")
 
 
+class TestFailurePatterns(TempDirCase):
+    """`failure_patterns` marks a run FAILED the way `failure_sentinel` does,
+    for failures the job reports in words nobody chose as a sentinel."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0)
+
+    def check(self, body: str, *patterns: str) -> deadmans.Status:
+        task = deadmans.Task(
+            "scheduled",
+            24.0,
+            "OK_SENTINEL",
+            "FAIL_SENTINEL",
+            False,
+            failure_patterns=deadmans.compile_failure_patterns(list(patterns), "t"),
+        )
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", body)
+        return deadmans.check_task(
+            task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+
+    def test_matching_line_is_failed_and_named(self) -> None:
+        result = self.check("start\nAPI Error: 401 Unauthorized\n", "API Error: 401")
+        self.assertEqual(result.state, "FAILED")
+        self.assertIn("'API Error: 401'", result.detail)
+
+    def test_pattern_is_anchored_to_the_start_of_the_line(self) -> None:
+        body = "start\nretrying after API Error: 401\n"
+        self.assertEqual(self.check(body, "API Error: 401").state, "NO_SENTINEL")
+        self.assertEqual(self.check(body, ".*API Error: 401").state, "FAILED")
+
+    def test_success_sentinel_still_wins(self) -> None:
+        body = "API Error: 401\nretried\nOK_SENTINEL\n"
+        self.assertEqual(self.check(body, "API Error: 401").state, "FRESH")
+
+    def test_failure_sentinel_keeps_working_beside_patterns(self) -> None:
+        result = self.check("FAIL_SENTINEL\n", "never matches")
+        self.assertEqual(result.state, "FAILED")
+        self.assertEqual(result.detail, "failure sentinel present, no success sentinel")
+
+    def test_no_patterns_changes_nothing(self) -> None:
+        self.assertEqual(self.check("API Error: 401\n").state, "NO_SENTINEL")
+
+
+class TestFailurePatternsConfig(TempDirCase):
+    def load(self, patterns) -> deadmans.Config:
+        task = {"name": "t", "max_age_hours": 1, "sentinel": "OK"}
+        if patterns is not None:
+            task["failure_patterns"] = patterns
+        path = self.tmp_path / "deadmans.json"
+        path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+        return deadmans.load_config(path)
+
+    def test_absent_means_no_patterns(self) -> None:
+        self.assertEqual(self.load(None).tasks["t"].failure_patterns, ())
+
+    def test_patterns_compile_at_load(self) -> None:
+        compiled = self.load(["API Error: 401", ".*bearer"]).tasks["t"].failure_patterns
+        self.assertEqual([p.pattern for p in compiled], ["API Error: 401", ".*bearer"])
+
+    def test_bad_values_raise(self) -> None:
+        for bad in ("API Error", [401], [""], ["("], {"a": "b"}):
+            with self.subTest(bad=bad), self.assertRaises(deadmans.ConfigError):
+                self.load(bad)
+
+
 class TestStartSentinel(TempDirCase):
     """A job that opens its log and never reaches the success string is hung,
     not merely sentinel-less."""
@@ -964,6 +1032,23 @@ class TestSameRunArtefactPrecedence(TempDirCase):
         result = self.check()
         self.assertEqual(result.state, "FRESH")
         self.assertIn("newer than the last logged run", result.detail)
+
+    def test_a_failure_pattern_also_marks_the_run_finished(self) -> None:
+        # Same as above with the failure reported by pattern. If the pattern
+        # did not count as the run finishing, the run's end would stretch to
+        # start + max_runtime_hours and the later record could not override.
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-15-0600.log",
+            "START_SENTINEL\nAPI Error: 401\n",
+            mtime=self.run_start + dt.timedelta(minutes=2),
+        )
+        self.write_ledger(self.run_start + dt.timedelta(minutes=17))
+        task = self.task(
+            failure_sentinel=None,
+            failure_patterns=deadmans.compile_failure_patterns(["API Error"], "t"),
+        )
+        self.assertEqual(self.check(task).state, "FRESH")
 
 
 class TestArtefactConfig(TempDirCase):
