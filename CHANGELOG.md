@@ -10,6 +10,7 @@ Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a 
 
 ### Changed
 
+- An unknown key at the top level or inside a task is now a config error. `check` exits 2 and names the key, the closest allowed key and the full allowed set. Before, a misspelling such as `artifact` for `artefact` was dropped without a word and the setting it meant to configure stayed off. **This can break a config that carries a typo or an extra key**, so run `check` once after upgrading.
 - The licence is declared as the SPDX string `MIT` with `license-files`, and building needs setuptools 77.0.3 or newer.
 - CI tests on Python 3.14 as well as 3.10 and 3.13, and the classifiers list 3.14.
 - Every workflow action is pinned to a full commit SHA, and pull requests run a redaction check (#11, #12).

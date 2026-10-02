@@ -80,6 +80,8 @@ Keys inside each task object.
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
 | `artefact` | Optional second freshness signal keyed to what the job *produces* rather than to its log, see below | none |
 
+A key that is not in these two tables is a config error. `check` exits 2 and names it, so a misspelling such as `artifact` for `artefact` stops the run instead of quietly switching that setting off.
+
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
 
 ## Timezones

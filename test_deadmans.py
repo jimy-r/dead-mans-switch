@@ -252,6 +252,39 @@ class TestLoadConfig(TempDirCase):
         with self.assertRaises(deadmans.ConfigError):
             deadmans.load_config(path)
 
+    def test_unknown_top_level_key_raises_naming_it(self) -> None:
+        path = self.write_config(
+            {"log_directory": "logs", "tasks": [self.minimal_task()]}
+        )
+        with self.assertRaises(deadmans.ConfigError) as caught:
+            deadmans.load_config(path)
+        message = str(caught.exception)
+        self.assertIn("'log_directory'", message)
+        self.assertIn("did you mean 'log_dir'", message)
+        self.assertIn("log_pattern, timezone, tasks", message)
+
+    def test_unknown_task_key_raises_naming_it_and_the_allowed_set(self) -> None:
+        # The US spelling used to be dropped without a word, leaving the
+        # artefact signal switched off for good.
+        path = self.write_config(
+            {"tasks": [self.minimal_task(artifact={"path": "out.txt"})]}
+        )
+        with self.assertRaises(deadmans.ConfigError) as caught:
+            deadmans.load_config(path)
+        message = str(caught.exception)
+        self.assertIn("task 'nightly-report'", message)
+        self.assertIn("'artifact' (did you mean 'artefact'?)", message)
+        for key in deadmans.TASK_KEYS:
+            self.assertIn(key, message)
+
+    def test_unknown_key_on_a_nameless_task_names_its_index(self) -> None:
+        path = self.write_config(
+            {"tasks": [{"nmae": "x", "max_age_hours": 1, "sentinel": "OK"}]}
+        )
+        with self.assertRaises(deadmans.ConfigError) as caught:
+            deadmans.load_config(path)
+        self.assertIn("tasks[0]: unknown key 'nmae'", str(caught.exception))
+
     def test_example_config_file_loads_cleanly(self) -> None:
         # deadmans.example.json ships in the repo root, next to this test.
         example = Path(__file__).resolve().parent / "deadmans.example.json"
@@ -1131,6 +1164,25 @@ class TestCLI(TempDirCase):
         code, _out, err = self.run_main(["check", "--config", str(config_path)])
         self.assertEqual(code, 2)
         self.assertIn("error", err)
+
+    def test_check_unknown_config_key_exits_two(self) -> None:
+        config_path = self.write_config(
+            {
+                "tasks": [
+                    {
+                        "name": "solo",
+                        "max_age_hours": 24,
+                        "sentinel": "OK",
+                        "manual": True,
+                        "artifact": {"path": "out.txt"},
+                    }
+                ]
+            }
+        )
+        code, out, err = self.run_main(["check", "--config", str(config_path)])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("unknown key 'artifact'", err)
 
     def test_init_writes_config(self) -> None:
         config_path = self.tmp_path / "deadmans.json"

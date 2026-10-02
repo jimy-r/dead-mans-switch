@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import json
 import re
 import sys
@@ -84,6 +85,43 @@ EXAMPLE_CONFIG: dict[str, Any] = {
 
 class ConfigError(Exception):
     """Raised for a malformed or unreadable deadmans.json."""
+
+
+TOP_LEVEL_KEYS = ("log_dir", "log_pattern", "timezone", "tasks")
+TASK_KEYS = (
+    "name",
+    "max_age_hours",
+    "sentinel",
+    "failure_sentinel",
+    "start_sentinel",
+    "max_runtime_hours",
+    "manual",
+    "artefact",
+)
+
+
+def reject_unknown_keys(
+    entry: dict[str, Any], allowed: tuple[str, ...], where: str
+) -> None:
+    """Raise on any key the loader does not read.
+
+    Every key is read with a default, so a misspelt one used to vanish
+    without a word. `artifact` for `artefact` switched the artefact signal
+    off, and a job that writes no log read as stale however fresh its
+    output was.
+    """
+    unknown = [key for key in entry if key not in allowed]
+    if not unknown:
+        return
+    named = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, allowed, n=1)
+        named.append(f"{key!r} (did you mean {close[0]!r}?)" if close else repr(key))
+    noun = "key" if len(unknown) == 1 else "keys"
+    raise ConfigError(
+        f"{where}: unknown {noun} {', '.join(named)}; "
+        f"allowed keys are {', '.join(allowed)}"
+    )
 
 
 def local_timezone() -> dt.tzinfo:
@@ -346,6 +384,7 @@ def load_config(path: Path) -> Config:
 
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: top-level JSON must be an object")
+    reject_unknown_keys(raw, TOP_LEVEL_KEYS, str(path))
 
     log_dir_value = raw.get("log_dir", DEFAULT_LOG_DIR)
     if not isinstance(log_dir_value, str) or not log_dir_value:
@@ -376,6 +415,8 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"{path}: tasks[{i}] must be an object")
 
         name = entry.get("name")
+        label = f"task {name!r}" if isinstance(name, str) and name else f"tasks[{i}]"
+        reject_unknown_keys(entry, TASK_KEYS, f"{path}: {label}")
         if not isinstance(name, str) or not name:
             raise ConfigError(f"{path}: tasks[{i}] is missing a non-empty name")
         if name in tasks:
