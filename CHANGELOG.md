@@ -2,7 +2,9 @@
 
 Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - unreleased
+
+The unknown-key check under Changed can stop a config that loaded under 0.2.0. Run `check` once after upgrading.
 
 ### Added
 
@@ -46,6 +48,6 @@ Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a 
 
 - First release. Config-driven sentinel freshness checking for scheduled jobs, with a staleness window per task, optional failure sentinels, manual tasks that pass until their first run, and exit codes made for cron and CI. One stdlib-only file.
 
-[Unreleased]: https://github.com/jimy-r/dead-mans-switch/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/jimy-r/dead-mans-switch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jimy-r/dead-mans-switch/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jimy-r/dead-mans-switch/releases/tag/v0.1.0

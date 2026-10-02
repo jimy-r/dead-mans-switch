@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dead-mans-switch"
-version = "0.2.0"
+version = "0.3.0"
 description = "A freshness checker for scheduled agent jobs. It does not watch for errors. It watches for the absence of success, and says so before you notice on your own."
 readme = "README.md"
 requires-python = ">=3.10"
