@@ -17,7 +17,7 @@ Each job you track writes a plain success string (a sentinel) into its own log f
 - no log exists yet, and the task is not flagged manual
 - the most recent log is older than its configured window
 - the most recent log has no success sentinel
-- the most recent log carries a failure sentinel instead
+- the most recent log carries a failure sentinel, or a line matching a failure pattern, instead
 - the most recent log shows the job starting but never finishing
 
 The exit code inverts what you would expect from a linter. 0 means every tracked task is fresh. 1 means at least one needs attention. That makes `deadmans.py check` a one-line addition to a cron job or a CI pipeline.
@@ -75,10 +75,13 @@ Keys inside each task object.
 | `max_age_hours` | How old the most recent log can be before it counts as stale | required |
 | `sentinel` | Success string to look for in the most recent log | required |
 | `failure_sentinel` | Optional string that marks an explicit failure | none |
+| `failure_patterns` | Optional list of regular expressions. A log line that matches one marks a failure the same way `failure_sentinel` does, see below | none |
 | `start_sentinel` | Optional string the job writes when it *begins*, so a run that starts and never finishes reports `HUNG` rather than `NO_SENTINEL` | none |
 | `max_runtime_hours` | How long a started run may go without finishing before it counts as hung. Needs `start_sentinel` | none |
 | `manual` | If true, a task with no log yet reports `MANUAL_OK` instead of a finding | `false` |
 | `artefact` | Optional second freshness signal keyed to what the job *produces* rather than to its log, see below | none |
+
+A key that is not in these two tables is a config error. `check` exits 2 and names it, so a misspelling such as `artifact` for `artefact` stops the run instead of quietly switching that setting off.
 
 See [`deadmans.example.json`](deadmans.example.json) for a working two-task example.
 
@@ -153,6 +156,21 @@ Staleness is checked first. A log old enough to breach its window is `STALE` reg
 The sentinel has to open a line. A log that only mentions the string somewhere in a sentence does not pass, because that mention is exactly what a run quoting its own last failure looks like, or a summary line naming the sentinel it went looking for. Treating a mention as a success is a false `FRESH` on a dead-man's switch, which is a worse failure than the false finding it would avoid.
 
 Leading whitespace, backticks, asterisks and underscores in front of the sentinel are fine, so a log line written as `` `MY_JOB_OK` `` or `**MY_JOB_OK**` still counts. A leading byte order mark on the file does not hide the first line. A sentinel of `MY_JOB_OK` does not match `MY_JOB_OK_PENDING`.
+
+## Failures the job doesn't announce
+
+`failure_sentinel` only catches a failure the job reports in a string you picked. Plenty of failures arrive in someone else's words, such as a client library printing `API Error: 401` after a token expired, or an uncaught Python exception. `failure_patterns` lists regular expressions for those lines.
+
+```json
+{
+  "name": "nightly-report",
+  "max_age_hours": 30,
+  "sentinel": "NIGHTLY_REPORT_OK",
+  "failure_patterns": ["Traceback \\(most recent call last\\)", ".*API Error: 401"]
+}
+```
+
+Each pattern is tried with Python's `re.match` against every line of the log, so it is anchored to the start of a line but not to its end. Start a pattern with `.*` to match text anywhere in a line. A matching line marks the run `FAILED` the same way `failure_sentinel` does, and a log that also carries the success sentinel still passes. Every pattern has to compile when the config loads, so a broken regex is a config error rather than a check that never fires.
 
 ## CLI
 

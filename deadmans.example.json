@@ -8,6 +8,7 @@
       "max_age_hours": 30,
       "sentinel": "NIGHTLY_REPORT_OK",
       "failure_sentinel": "NIGHTLY_REPORT_FAILED",
+      "failure_patterns": ["Traceback \\(most recent call last\\)"],
       "start_sentinel": "NIGHTLY_REPORT_START",
       "max_runtime_hours": 2,
       "manual": false

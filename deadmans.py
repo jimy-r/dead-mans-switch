@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import json
 import re
 import sys
@@ -68,6 +69,7 @@ EXAMPLE_CONFIG: dict[str, Any] = {
             "max_age_hours": 30,
             "sentinel": "NIGHTLY_REPORT_OK",
             "failure_sentinel": "NIGHTLY_REPORT_FAILED",
+            "failure_patterns": [r"Traceback \(most recent call last\)"],
             "start_sentinel": "NIGHTLY_REPORT_START",
             "max_runtime_hours": 2,
             "manual": False,
@@ -84,6 +86,44 @@ EXAMPLE_CONFIG: dict[str, Any] = {
 
 class ConfigError(Exception):
     """Raised for a malformed or unreadable deadmans.json."""
+
+
+TOP_LEVEL_KEYS = ("log_dir", "log_pattern", "timezone", "tasks")
+TASK_KEYS = (
+    "name",
+    "max_age_hours",
+    "sentinel",
+    "failure_sentinel",
+    "failure_patterns",
+    "start_sentinel",
+    "max_runtime_hours",
+    "manual",
+    "artefact",
+)
+
+
+def reject_unknown_keys(
+    entry: dict[str, Any], allowed: tuple[str, ...], where: str
+) -> None:
+    """Raise on any key the loader does not read.
+
+    Every key is read with a default, so a misspelt one used to vanish
+    without a word. `artifact` for `artefact` switched the artefact signal
+    off, and a job that writes no log read as stale however fresh its
+    output was.
+    """
+    unknown = [key for key in entry if key not in allowed]
+    if not unknown:
+        return
+    named = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, allowed, n=1)
+        named.append(f"{key!r} (did you mean {close[0]!r}?)" if close else repr(key))
+    noun = "key" if len(unknown) == 1 else "keys"
+    raise ConfigError(
+        f"{where}: unknown {noun} {', '.join(named)}; "
+        f"allowed keys are {', '.join(allowed)}"
+    )
 
 
 def local_timezone() -> dt.tzinfo:
@@ -161,6 +201,7 @@ class Task(NamedTuple):
     start_sentinel: str | None = None
     max_runtime_hours: float | None = None
     artefact: Artefact | None = None
+    failure_patterns: tuple[re.Pattern[str], ...] = ()
 
 
 class Status(NamedTuple):
@@ -208,6 +249,28 @@ def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
         else:
             regex_parts.append(re.escape(part))
     return re.compile("^" + "".join(regex_parts) + "$")
+
+
+def compile_failure_patterns(raw: Any, where: str) -> tuple[re.Pattern[str], ...]:
+    """Validate a task's `failure_patterns` list into compiled regexes."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where}: failure_patterns must be a list of regex strings")
+    compiled = []
+    for i, pattern in enumerate(raw):
+        # An empty pattern matches every line, so every run would read FAILED.
+        if not isinstance(pattern, str) or not pattern:
+            raise ConfigError(
+                f"{where}: failure_patterns[{i}] must be a non-empty regex string"
+            )
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise ConfigError(
+                f"{where}: failure_patterns[{i}] is not a valid regex: {exc}"
+            ) from exc
+    return tuple(compiled)
 
 
 ARTEFACT_FORMATS = ("mtime", "jsonl")
@@ -346,6 +409,7 @@ def load_config(path: Path) -> Config:
 
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: top-level JSON must be an object")
+    reject_unknown_keys(raw, TOP_LEVEL_KEYS, str(path))
 
     log_dir_value = raw.get("log_dir", DEFAULT_LOG_DIR)
     if not isinstance(log_dir_value, str) or not log_dir_value:
@@ -376,6 +440,8 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"{path}: tasks[{i}] must be an object")
 
         name = entry.get("name")
+        label = f"task {name!r}" if isinstance(name, str) and name else f"tasks[{i}]"
+        reject_unknown_keys(entry, TASK_KEYS, f"{path}: {label}")
         if not isinstance(name, str) or not name:
             raise ConfigError(f"{path}: tasks[{i}] is missing a non-empty name")
         if name in tasks:
@@ -401,6 +467,9 @@ def load_config(path: Path) -> Config:
                 f"{path}: task {name!r} failure_sentinel must be a non-empty "
                 "string if present"
             )
+        failure_patterns = compile_failure_patterns(
+            entry.get("failure_patterns"), f"{path}: task {name!r}"
+        )
 
         manual = entry.get("manual", False)
         if not isinstance(manual, bool):
@@ -452,6 +521,7 @@ def load_config(path: Path) -> Config:
             start_sentinel=start_sentinel,
             max_runtime_hours=max_runtime_hours,
             artefact=artefact,
+            failure_patterns=failure_patterns,
         )
 
     return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
@@ -512,6 +582,25 @@ def sentinel_matches(sentinel: str, body: str) -> bool:
     )
 
 
+def failure_reason(task: Task, body: str) -> str | None:
+    """What marks this log as a failed run, or None when nothing does.
+
+    Each of `failure_patterns` is tried with re.match against every line, so
+    a pattern is anchored to the start of a line (not to its end). A pattern
+    meant to match mid-line starts with `.*`.
+    """
+    if task.failure_sentinel is not None and sentinel_matches(
+        task.failure_sentinel, body
+    ):
+        return "failure sentinel present"
+    if task.failure_patterns:
+        lines = body.lstrip("﻿").splitlines()
+        for pattern in task.failure_patterns:
+            if any(pattern.match(line) for line in lines):
+                return f"failure pattern {pattern.pattern!r} matched"
+    return None
+
+
 # Artefact overrides the log only when it postdates that run's END by more
 # than this margin: a record the SAME run emits partway through must not
 # outrank that run's own FAILED or HUNG verdict. A record stamped
@@ -541,9 +630,8 @@ def _logged_run_end(
         end = log_time
     if log_time is not None and (end is None or end < log_time):
         end = log_time
-    finished = sentinel_matches(task.sentinel, body) or (
-        task.failure_sentinel is not None
-        and sentinel_matches(task.failure_sentinel, body)
+    finished = (
+        sentinel_matches(task.sentinel, body) or failure_reason(task, body) is not None
     )
     if not finished and task.max_runtime_hours is not None and log_time is not None:
         end = max(end, log_time + dt.timedelta(hours=task.max_runtime_hours))
@@ -638,9 +726,7 @@ def _check_task(
             )
 
     success = sentinel_matches(task.sentinel, body)
-    failure = task.failure_sentinel is not None and sentinel_matches(
-        task.failure_sentinel, body
-    )
+    failure = failure_reason(task, body)
 
     # Staleness is checked first and short-circuits: a log old enough to
     # breach the window is a finding regardless of what it contains. Within
@@ -661,7 +747,7 @@ def _check_task(
             "FAILED",
             log_time,
             age_hours,
-            "failure sentinel present, no success sentinel",
+            f"{failure}, no success sentinel",
         )
     # A log that opened but never reached its success string is a different
     # animal from one that says nothing at all: the job fired, then died or

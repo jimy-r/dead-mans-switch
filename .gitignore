@@ -4,7 +4,7 @@ __pycache__/
 logs/
 *.log
 
-# secret-file patterns (defence-in-depth; credentials live in Bitwarden, never here)
+# secret-file patterns (defence-in-depth; credentials live in a password manager, never here)
 .env
 .env.*
 *.key
