@@ -37,7 +37,7 @@ ruff check .
 ruff format --check .
 ```
 
-CI runs the suite on Python 3.10 and 3.13 and lints on 3.13. Lint pins live in `.github/requirements-ci.txt` and the explicit select lives in `ruff.toml`, so a ruff bump cannot silently change what is linted. Install the pinned version if a finding looks unfamiliar.
+CI runs the suite on Python 3.10, 3.13 and 3.14 and lints on 3.13. Lint pins live in `.github/requirements-ci.txt` and the explicit select lives in `ruff.toml`, so a ruff bump cannot silently change what is linted. Install the pinned version if a finding looks unfamiliar.
 
 ## Changing the checker
 

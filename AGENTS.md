@@ -11,4 +11,8 @@ Run the tests before you commit: `python -m pytest test_deadmans.py` (CI runs
 the same suite as `python -m unittest -v`), then `ruff check .` and
 `ruff format --check .`.
 
+This repo is public, so a commit must carry no personal identifiers, no
+credentials or realistic stand-ins for them, no absolute paths from your own
+machine and no content copied from a private workspace.
+
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full contributor rules.
