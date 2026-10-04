@@ -2,7 +2,7 @@
 
 Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-10-04
 
 The unknown-key check under Changed can stop a config that loaded under 0.2.0. Run `check` once after upgrading.
 
