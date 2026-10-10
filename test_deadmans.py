@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import deadmans
 
@@ -80,6 +81,37 @@ class TestCompileLogPattern(unittest.TestCase):
         # A regex-unsafe name should not accidentally match a different,
         # unrelated task via metacharacter interpretation.
         self.assertIsNone(matcher.match("taskAv1xx_2026-01-15-0930.log"))
+
+    def test_time_accepts_seconds(self) -> None:
+        matcher = deadmans.compile_log_pattern(deadmans.DEFAULT_LOG_PATTERN, "t")
+        match = matcher.match("t_2026-01-15-093015.log")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group("time"), "093015")
+
+    def test_time_of_any_other_width_does_not_match(self) -> None:
+        matcher = deadmans.compile_log_pattern(deadmans.DEFAULT_LOG_PATTERN, "t")
+        for name in (
+            "t_2026-01-15-930.log",
+            "t_2026-01-15-09301.log",
+            "t_2026-01-15-0930150.log",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(matcher.match(name))
+
+    def test_loose_pattern_matches_a_time_of_any_width(self) -> None:
+        matcher = deadmans.compile_log_pattern(
+            deadmans.DEFAULT_LOG_PATTERN, "t", loose=True
+        )
+        for name in (
+            "t_2026-01-15-9.log",
+            "t_2026-01-15-09301.log",
+            "t_2026-01-15-0930.log",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNotNone(matcher.match(name))
+        # Still this task's names only, and still a date in the date slot.
+        self.assertIsNone(matcher.match("other_2026-01-15-0930.log"))
+        self.assertIsNone(matcher.match("t_20260115-0930.log"))
 
 
 class TestLoadConfig(TempDirCase):
@@ -291,6 +323,14 @@ class TestLoadConfig(TempDirCase):
         config = deadmans.load_config(example)
         self.assertEqual(set(config.tasks), {"nightly-report", "weekly-audit"})
 
+    def test_example_config_file_matches_what_init_writes(self) -> None:
+        # A new key goes into both, so the shipped example and the starter
+        # config `init` writes cannot drift apart.
+        example = Path(__file__).resolve().parent / "deadmans.example.json"
+        self.assertEqual(
+            json.loads(example.read_text(encoding="utf-8")), deadmans.EXAMPLE_CONFIG
+        )
+
 
 class TestResolveTimezone(unittest.TestCase):
     def test_none_and_local_give_the_host_offset(self) -> None:
@@ -456,6 +496,144 @@ class TestLatestLogAndParseTime(TempDirCase):
         log = write_log(log_dir, "t_9999-99-99-9999.log", "body")
         self.assertIsNone(
             deadmans.parse_log_time(log, "t", deadmans.DEFAULT_LOG_PATTERN)
+        )
+
+    def test_parse_log_time_reads_a_six_digit_time(self) -> None:
+        log_dir = self.tmp_path / "logs"
+        log = write_log(log_dir, "t_2026-03-04-153045.log", "body")
+        parsed = deadmans.parse_log_time(
+            log, "t", deadmans.DEFAULT_LOG_PATTERN, dt.timezone.utc
+        )
+        self.assertEqual(
+            parsed, dt.datetime(2026, 3, 4, 15, 30, 45, tzinfo=dt.timezone.utc)
+        )
+
+    def test_skips_a_name_with_an_impossible_date(self) -> None:
+        # Month 13 sorts after every real month, so taking the last name in
+        # sort order used to hand back this file instead of the real run.
+        log_dir = self.tmp_path / "logs"
+        real = write_log(log_dir, "t_2026-01-03-0900.log", "real")
+        write_log(log_dir, "t_2026-13-01-0000.log", "stray")
+        rejected: list[str] = []
+        found = deadmans.latest_log(
+            "t", log_dir, deadmans.DEFAULT_LOG_PATTERN, rejected=rejected
+        )
+        self.assertEqual(found, real)
+        self.assertEqual(rejected, ["t_2026-13-01-0000.log"])
+
+    def test_skips_a_name_stamped_ahead_of_the_clock(self) -> None:
+        log_dir = self.tmp_path / "logs"
+        real = write_log(log_dir, "t_2026-01-03-0900.log", "real")
+        write_log(log_dir, "t_2099-12-01-0000.log", "stray")
+        rejected: list[str] = []
+        found = deadmans.latest_log(
+            "t",
+            log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=dt.timezone.utc,
+            now=dt.datetime(2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc),
+            rejected=rejected,
+        )
+        self.assertEqual(found, real)
+        self.assertEqual(rejected, ["t_2099-12-01-0000.log"])
+
+    def test_a_stamp_inside_the_skew_tolerance_still_counts(self) -> None:
+        # Two hosts rarely agree to the second. A name three minutes ahead of
+        # the checker's clock is a run; one six minutes ahead is not.
+        log_dir = self.tmp_path / "logs"
+        near = write_log(log_dir, "t_2026-01-15-1203.log", "three minutes ahead")
+        write_log(log_dir, "t_2026-01-15-1206.log", "six minutes ahead")
+        found = deadmans.latest_log(
+            "t",
+            log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=dt.timezone.utc,
+            now=dt.datetime(2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc),
+        )
+        self.assertEqual(found, near)
+
+    def test_a_log_from_just_before_the_clocks_go_back_is_not_ahead(self) -> None:
+        # 01:50 happens twice on the morning the clocks go back. Stamped in
+        # the first pass and checked twenty minutes later, in the second, the
+        # wall clock reads 01:10, which looks like forty minutes before the log.
+        try:
+            zone = ZoneInfo("Europe/London")
+        except ZoneInfoNotFoundError:
+            self.skipTest("no tz database on this host")
+        log_dir = self.tmp_path / "logs"
+        log = write_log(log_dir, "t_2026-10-25-0150.log", "body")
+        rejected: list[str] = []
+        found = deadmans.latest_log(
+            "t",
+            log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=zone,
+            now=dt.datetime(2026, 10, 25, 1, 10, fold=1, tzinfo=zone),
+            rejected=rejected,
+        )
+        self.assertEqual(found, log)
+        self.assertEqual(rejected, [])
+
+    def test_a_name_stamped_in_year_9999_is_skipped_without_overflow(self) -> None:
+        # Converting that stamp to UTC from a zone behind it would run past
+        # the last year a datetime can hold.
+        log_dir = self.tmp_path / "logs"
+        real = write_log(log_dir, "t_2026-01-03-0900.log", "real")
+        write_log(log_dir, "t_9999-12-31-2359.log", "stray")
+        behind = dt.timezone(dt.timedelta(hours=-5))
+        rejected: list[str] = []
+        found = deadmans.latest_log(
+            "t",
+            log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=behind,
+            now=dt.datetime(2026, 1, 15, 12, 0, tzinfo=behind),
+            rejected=rejected,
+        )
+        self.assertEqual(found, real)
+        self.assertEqual(rejected, ["t_9999-12-31-2359.log"])
+
+    def test_picks_by_run_time_where_the_names_sort_another_way(self) -> None:
+        # With the time ahead of the date in the pattern, the last name in
+        # sort order is the latest time of day, whichever date it is from.
+        log_dir = self.tmp_path / "logs"
+        pattern = "{time}_{date}_{task}.log"
+        write_log(log_dir, "2359_2026-01-01_t.log", "old")
+        newest = write_log(log_dir, "0001_2026-01-15_t.log", "newest")
+        self.assertEqual(deadmans.latest_log("t", log_dir, pattern), newest)
+
+    def test_a_later_six_digit_time_outranks_a_four_digit_one(self) -> None:
+        # As text "0930_run" sorts after "093015_run". As a time it is
+        # fifteen seconds earlier.
+        log_dir = self.tmp_path / "logs"
+        pattern = "{task}_{date}-{time}_run.log"
+        write_log(log_dir, "t_2026-01-15-0930_run.log", "earlier")
+        newest = write_log(log_dir, "t_2026-01-15-093015_run.log", "later")
+        self.assertEqual(deadmans.latest_log("t", log_dir, pattern), newest)
+
+    def test_reports_every_name_it_set_aside(self) -> None:
+        log_dir = self.tmp_path / "logs"
+        write_log(log_dir, "t_2026-01-15-09301.log", "five-digit time")
+        write_log(log_dir, "t_2026-13-01-0000.log", "month 13")
+        write_log(log_dir, "t_2099-12-01-0000.log", "decades ahead")
+        write_log(log_dir, "other_2026-01-15-09301.log", "another task's log")
+        rejected: list[str] = []
+        found = deadmans.latest_log(
+            "t",
+            log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            tz=dt.timezone.utc,
+            now=dt.datetime(2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc),
+            rejected=rejected,
+        )
+        self.assertIsNone(found)
+        self.assertEqual(
+            rejected,
+            [
+                "t_2026-01-15-09301.log",
+                "t_2026-13-01-0000.log",
+                "t_2099-12-01-0000.log",
+            ],
         )
 
 
@@ -1117,6 +1295,239 @@ class TestArtefactConfig(TempDirCase):
             self.config({"path": "o.jsonl", "format": "jsonl", "match": {"a": 7}})
 
 
+class TestLogNameGuards(TempDirCase):
+    """One stray log name must not decide a task, and a directory of names
+    the checker cannot read is not the same thing as no log yet."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+        self.task = deadmans.Task(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel=None,
+            manual=False,
+        )
+
+    def check(self, task: deadmans.Task | None = None) -> deadmans.Status:
+        return deadmans.check_task(
+            task or self.task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=self.now,
+            tz=dt.timezone.utc,
+        )
+
+    def test_future_stamped_name_does_not_hide_a_dead_job(self) -> None:
+        # The job last ran five days ago. A stray name stamped decades ahead
+        # carries the success line and sorts last, and it used to read FRESH
+        # with a negative age for as long as the file sat there.
+        write_log(self.log_dir, "scheduled_2026-01-10-1000.log", "OK_SENTINEL\n")
+        write_log(self.log_dir, "scheduled_2099-12-01-0000.log", "OK_SENTINEL\n")
+        result = self.check()
+        self.assertEqual(result.state, "STALE")
+        self.assertAlmostEqual(result.age_hours, 122.0, places=3)
+        self.assertIn("scheduled_2099-12-01-0000.log", result.detail)
+
+    def test_impossible_date_name_does_not_hide_a_dead_job(self) -> None:
+        # Month 13 gave no age at all, so the staleness test never fired.
+        write_log(self.log_dir, "scheduled_2026-01-10-1000.log", "OK_SENTINEL\n")
+        write_log(self.log_dir, "scheduled_2026-13-01-0000.log", "OK_SENTINEL\n")
+        result = self.check()
+        self.assertEqual(result.state, "STALE")
+        self.assertIn("scheduled_2026-13-01-0000.log", result.detail)
+
+    def test_stray_name_beside_a_fresh_run_stays_fresh_and_is_named(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "OK_SENTINEL\n")
+        write_log(self.log_dir, "scheduled_2099-12-01-0000.log", "anything\n")
+        result = self.check()
+        self.assertEqual(result.state, "FRESH")
+        self.assertAlmostEqual(result.age_hours, 2.0, places=3)
+        self.assertIn("skipped 1 log name(s)", result.detail)
+        self.assertIn("scheduled_2099-12-01-0000.log", result.detail)
+
+    def test_clean_directory_adds_nothing_to_the_detail(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "OK_SENTINEL\n")
+        self.assertEqual(self.check().detail, "ok")
+
+    def test_manual_task_with_only_unreadable_names_is_a_finding(self) -> None:
+        # A producer that names its logs with a five-digit time has run, and
+        # MANUAL_OK ("no log yet") would never go stale.
+        write_log(self.log_dir, "scheduled_2026-01-15-09301.log", "OK_SENTINEL\n")
+        result = self.check(self.task._replace(manual=True))
+        self.assertEqual(result.state, "LOG_UNREADABLE")
+        self.assertIsNone(result.age_hours)
+        self.assertIn("scheduled_2026-01-15-09301.log", result.detail)
+
+    def test_scheduled_task_with_only_unreadable_names_is_not_never_ran(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-13-01-0000.log", "OK_SENTINEL\n")
+        self.assertEqual(self.check().state, "LOG_UNREADABLE")
+
+    def test_only_future_stamped_names_is_log_unreadable(self) -> None:
+        write_log(self.log_dir, "scheduled_2099-12-01-0000.log", "OK_SENTINEL\n")
+        self.assertEqual(self.check().state, "LOG_UNREADABLE")
+
+    def test_another_tasks_odd_names_leave_a_manual_task_alone(self) -> None:
+        write_log(self.log_dir, "other_2026-01-15-09301.log", "OK_SENTINEL\n")
+        result = self.check(self.task._replace(manual=True))
+        self.assertEqual(result.state, "MANUAL_OK")
+        self.assertEqual(result.detail, "manual task; no log yet")
+
+    def test_log_unreadable_is_a_finding(self) -> None:
+        self.assertNotIn("LOG_UNREADABLE", deadmans.OK_STATES)
+
+    def test_six_digit_time_gives_the_age_to_the_second(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-103015.log", "OK_SENTINEL\n")
+        result = self.check()
+        self.assertEqual(result.state, "FRESH")
+        self.assertAlmostEqual(result.age_hours, 1.0 + 29.75 / 60.0, places=3)
+
+    def test_fresh_artefact_still_decides_when_no_log_is_readable(self) -> None:
+        ledger = self.tmp_path / "out.jsonl"
+        ledger.write_text(
+            json.dumps({"ts": "2026-01-15T10:00:00+00:00"}) + "\n", encoding="utf-8"
+        )
+        write_log(self.log_dir, "scheduled_2026-01-15-09301.log", "OK_SENTINEL\n")
+        task = self.task._replace(artefact=deadmans.Artefact(ledger, "jsonl", "ts", ()))
+        result = self.check(task)
+        self.assertEqual(result.state, "FRESH")
+        self.assertIn("no readable log file", result.detail)
+        self.assertIn("scheduled_2026-01-15-09301.log", result.detail)
+
+    def test_a_long_list_of_skipped_names_is_counted_not_printed(self) -> None:
+        for minute in range(5):
+            write_log(self.log_dir, f"scheduled_2099-12-01-000{minute}.log", "x\n")
+        detail = self.check().detail
+        self.assertIn("skipped 5 log name(s)", detail)
+        self.assertIn("and 2 more", detail)
+        self.assertNotIn("scheduled_2099-12-01-0004.log", detail)
+
+
+class TestLineStamp(TempDirCase):
+    """A producer that stamps every line never writes its sentinel at the
+    start of one. `line_stamp` lets one ISO time sit in front of it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+        self.now = dt.datetime(2026, 1, 15, 12, 0, 0)
+        self.task = deadmans.Task(
+            name="scheduled",
+            max_age_hours=24.0,
+            sentinel="OK_SENTINEL",
+            failure_sentinel="FAIL_SENTINEL",
+            manual=False,
+            line_stamp=True,
+        )
+
+    def check(self, body: str, **overrides) -> deadmans.Status:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", body)
+        task = self.task._replace(**overrides) if overrides else self.task
+        return deadmans.check_task(
+            task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=self.now
+        )
+
+    def test_stamped_sentinel_is_not_a_success_by_default(self) -> None:
+        body = "2026-01-15T10:00:00Z OK_SENTINEL\n"
+        self.assertEqual(self.check(body, line_stamp=False).state, "NO_SENTINEL")
+
+    def test_stamped_sentinel_passes_with_line_stamp(self) -> None:
+        for stamp in (
+            "2026-01-15T10:00:00",
+            "2026-01-15T10:00:00Z",
+            "2026-01-15T10:00:00.123+10:00",
+            "2026-01-15T10:00:00-0500",
+            "2026-01-15 10:00:00",
+            "2026-01-15 10:00:00,123",
+        ):
+            with self.subTest(stamp=stamp):
+                body = f"{stamp} starting\n{stamp} OK_SENTINEL\n"
+                self.assertEqual(self.check(body).state, "FRESH")
+
+    def test_unstamped_sentinel_still_passes_with_line_stamp(self) -> None:
+        self.assertEqual(self.check("run ok\nOK_SENTINEL\n").state, "FRESH")
+
+    def test_decoration_after_the_stamp_is_tolerated(self) -> None:
+        body = "2026-01-15T10:00:00Z `OK_SENTINEL`\n"
+        self.assertEqual(self.check(body).state, "FRESH")
+
+    def test_mention_further_along_a_stamped_line_is_not_a_success(self) -> None:
+        body = "2026-01-15T10:00:00Z looked for OK_SENTINEL and found none\n"
+        self.assertEqual(self.check(body).state, "NO_SENTINEL")
+
+    def test_only_one_stamp_is_allowed_in_front(self) -> None:
+        body = "2026-01-15T10:00:00Z 2026-01-15T10:00:01Z OK_SENTINEL\n"
+        self.assertEqual(self.check(body).state, "NO_SENTINEL")
+
+    def test_a_date_alone_is_not_a_stamp(self) -> None:
+        self.assertEqual(self.check("2026-01-15 OK_SENTINEL\n").state, "NO_SENTINEL")
+
+    def test_stamped_failure_sentinel_fails(self) -> None:
+        body = "2026-01-15T10:00:00Z FAIL_SENTINEL\n"
+        self.assertEqual(self.check(body).state, "FAILED")
+
+    def test_stamped_start_sentinel_reads_as_hung(self) -> None:
+        result = self.check(
+            "2026-01-15T10:00:00Z START_SENTINEL\n", start_sentinel="START_SENTINEL"
+        )
+        self.assertEqual(result.state, "HUNG")
+
+    def test_stamped_finish_line_ends_the_run_for_the_artefact(self) -> None:
+        # A stamped failure line still marks the run finished. If it did not,
+        # the run's end would stretch to start + max_runtime_hours and a later
+        # record from a separate invocation could not override the log.
+        utc = dt.timezone.utc
+        start = dt.datetime(2026, 1, 15, 6, 0, tzinfo=utc)
+        ledger = self.tmp_path / "out.jsonl"
+        ledger.write_text(
+            json.dumps({"ts": (start + dt.timedelta(minutes=17)).isoformat()}) + "\n",
+            encoding="utf-8",
+        )
+        write_log(
+            self.log_dir,
+            "scheduled_2026-01-15-0600.log",
+            "2026-01-15T06:00:00Z START_SENTINEL\n2026-01-15T06:02:00Z FAIL_SENTINEL\n",
+            mtime=start + dt.timedelta(minutes=2),
+        )
+        task = self.task._replace(
+            start_sentinel="START_SENTINEL",
+            max_runtime_hours=5.0,
+            artefact=deadmans.Artefact(ledger, "jsonl", "ts", ()),
+        )
+        result = deadmans.check_task(
+            task,
+            self.log_dir,
+            deadmans.DEFAULT_LOG_PATTERN,
+            now=dt.datetime(2026, 1, 15, 12, 0, tzinfo=utc),
+            tz=utc,
+        )
+        self.assertEqual(result.state, "FRESH")
+        self.assertIn("newer than the last logged run", result.detail)
+
+
+class TestLineStampConfig(TempDirCase):
+    def config(self, **task_keys) -> deadmans.Config:
+        path = self.tmp_path / "deadmans.json"
+        task = {"name": "t", "max_age_hours": 24, "sentinel": "OK"}
+        task.update(task_keys)
+        path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+        return deadmans.load_config(path)
+
+    def test_defaults_to_off(self) -> None:
+        self.assertFalse(self.config().tasks["t"].line_stamp)
+
+    def test_true_loads(self) -> None:
+        self.assertTrue(self.config(line_stamp=True).tasks["t"].line_stamp)
+
+    def test_non_boolean_raises(self) -> None:
+        for value in ("yes", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaises(deadmans.ConfigError):
+                    self.config(line_stamp=value)
+
+
 class TestCLI(TempDirCase):
     def write_config(self, obj: dict) -> Path:
         path = self.tmp_path / "deadmans.json"
@@ -1167,6 +1578,26 @@ class TestCLI(TempDirCase):
         code, out, _err = self.run_main(["check", "--config", str(config_path)])
         self.assertEqual(code, 1)
         self.assertIn("STALE", out)
+
+    def test_check_unreadable_log_names_exit_one(self) -> None:
+        config_path = self.write_config(
+            {
+                "log_dir": "logs",
+                "tasks": [
+                    {
+                        "name": "solo",
+                        "max_age_hours": 24,
+                        "sentinel": "OK",
+                        "manual": True,
+                    }
+                ],
+            }
+        )
+        write_log(config_path.parent / "logs", "solo_2026-01-15-09301.log", "OK\n")
+        code, out, _err = self.run_main(["check", "--config", str(config_path)])
+        self.assertEqual(code, 1)
+        self.assertIn("LOG_UNREADABLE", out)
+        self.assertIn("solo_2026-01-15-09301.log", out)
 
     def test_check_json_output_is_valid_and_exit_matches(self) -> None:
         config_path = self.write_config(

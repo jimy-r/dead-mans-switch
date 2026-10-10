@@ -11,6 +11,7 @@
       "failure_patterns": ["Traceback \\(most recent call last\\)"],
       "start_sentinel": "NIGHTLY_REPORT_START",
       "max_runtime_hours": 2,
+      "line_stamp": false,
       "manual": false
     },
     {

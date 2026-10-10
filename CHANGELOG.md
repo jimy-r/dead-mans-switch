@@ -2,6 +2,25 @@
 
 Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - unreleased
+
+A task that passed on a log name the checker should not have trusted can report a finding after this upgrade. Run `check` once and read the detail lines.
+
+### Added
+
+- `line_stamp`, an optional per-task key. When true, one ISO 8601 time may sit in front of `sentinel`, `failure_sentinel` and `start_sentinel`, for a job whose logger stamps every line. It is off by default, so a sentinel still has to open its line.
+
+### Fixed
+
+- One stray log name can no longer hold a dead job at `FRESH`. The checker took the last matching filename in sort order, so a name stamped in the future, or one with a date that does not exist, was read as the newest run. Its age came out negative or missing, so the staleness test never fired, and the success line inside it passed the task while every real log went unread. A name now counts only when its stamp is a real time no more than five minutes ahead of the clock, and the newest log is chosen by that time. Each skipped name is listed in the task's detail line.
+- A task whose log names were all skipped reports `LOG_UNREADABLE`. Before, it reported `NEVER_RAN`, or `MANUAL_OK` on a manual task, which never goes stale.
+- `{time}` in `log_pattern` accepts `HHMMSS` as well as `HHMM`. A producer that stamps seconds into its log names used to match nothing, with the same `MANUAL_OK` result.
+
+### Changed
+
+- `SECURITY.md` no longer describes notification channels. The tool prints a report and sets an exit code, and it sends nothing.
+- The README states the `{date}` and `{time}` formats, the ten-minute margin an artefact needs over the end of the last logged run, and the five-minute clock-skew rule.
+
 ## [0.3.0] - 2026-10-04
 
 The unknown-key check under Changed can stop a config that loaded under 0.2.0. Run `check` once after upgrading.
@@ -48,6 +67,7 @@ The unknown-key check under Changed can stop a config that loaded under 0.2.0. R
 
 - First release. Config-driven sentinel freshness checking for scheduled jobs, with a staleness window per task, optional failure sentinels, manual tasks that pass until their first run, and exit codes made for cron and CI. One stdlib-only file.
 
+[0.3.1]: https://github.com/jimy-r/dead-mans-switch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jimy-r/dead-mans-switch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jimy-r/dead-mans-switch/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jimy-r/dead-mans-switch/releases/tag/v0.1.0
