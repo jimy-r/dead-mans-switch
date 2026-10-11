@@ -22,7 +22,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: jimy-r/redaction-check-action@65883d8d132e1a881dfaa4065b76dfad5176c7ea # v1.1.0
+      - uses: jimy-r/redaction-check-action@c626124f07c3dbf0f89764779ef920cf91f36135 # v1.1.1
         with:
           # github.base_ref is empty on workflow_dispatch, which would leave
           # the manual trigger declared above with nothing to diff against.
