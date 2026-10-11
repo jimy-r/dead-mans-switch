@@ -188,6 +188,19 @@ def as_aware(value: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=tz)
 
 
+def hours_between(later: dt.datetime, earlier: dt.datetime) -> float:
+    """Elapsed hours from `earlier` to `later`, both aware, measured in UTC.
+
+    Python subtracts two datetimes that share one tzinfo object by their
+    wall-clock readings and ignores the offset each one carries. In a named
+    zone that is an hour out whenever a daylight-saving change falls between
+    them: noon to noon across a fall-back night reads 24 hours where 25 went
+    by. Converting both to UTC first gives the time that really passed.
+    """
+    utc = dt.timezone.utc
+    return (later.astimezone(utc) - earlier.astimezone(utc)).total_seconds() / 3600.0
+
+
 class Artefact(NamedTuple):
     """A second freshness signal, keyed to what the job produces.
 
@@ -771,7 +784,7 @@ def _check_task(
     )
 
     def from_artefact(when: dt.datetime, note: str) -> Status:
-        age = (now - when).total_seconds() / 3600.0
+        age = hours_between(now, when)
         label = task.artefact.path.name
         if age > task.max_age_hours:
             return Status(
@@ -803,7 +816,7 @@ def _check_task(
         return Status(task.name, "NEVER_RAN", None, None, "no log file matches pattern")
 
     log_time = parse_log_time(log, task.name, log_pattern, tz)
-    age_hours = (now - log_time).total_seconds() / 3600.0 if log_time else None
+    age_hours = hours_between(now, log_time) if log_time else None
 
     try:
         body = log.read_text(encoding="utf-8", errors="replace")

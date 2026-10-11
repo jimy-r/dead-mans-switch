@@ -428,6 +428,101 @@ class TestTimezoneSkew(TempDirCase):
         self.assertAlmostEqual(result.age_hours, 4.0, places=3)
 
 
+class TestAgeAcrossDaylightSavingChange(TempDirCase):
+    """An age is the time that passed, whatever the wall clock did meanwhile.
+
+    Two datetimes that share one named zone subtract by wall clock in Python,
+    so noon to noon across a clock change used to read 24 hours either way.
+    Each window below sits between the wall-clock figure and the real one, so
+    the state is wrong as well as the number if the age is taken that way.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_dir = self.tmp_path / "logs"
+
+    def zone(self, name: str) -> ZoneInfo:
+        try:
+            return ZoneInfo(name)
+        except ZoneInfoNotFoundError:
+            self.skipTest("no tz database on this host")
+
+    def task(self, max_age_hours: float, **keys) -> deadmans.Task:
+        return deadmans.Task(
+            name="scheduled",
+            max_age_hours=max_age_hours,
+            sentinel="OK_SENTINEL",
+            failure_sentinel=None,
+            manual=False,
+            **keys,
+        )
+
+    def check(self, task: deadmans.Task, now: dt.datetime) -> deadmans.Status:
+        return deadmans.check_task(
+            task, self.log_dir, deadmans.DEFAULT_LOG_PATTERN, now=now, tz=now.tzinfo
+        )
+
+    def ledger_task(self, max_age_hours: float, stamp: str) -> deadmans.Task:
+        ledger = self.tmp_path / "findings.jsonl"
+        ledger.write_text(json.dumps({"ts": stamp}) + "\n", encoding="utf-8")
+        artefact = deadmans.parse_artefact(
+            {"path": str(ledger), "format": "jsonl"}, self.tmp_path, "test"
+        )
+        return self.task(max_age_hours, artefact=artefact)
+
+    def test_hours_between_counts_the_repeated_hour(self) -> None:
+        # Clocks in New York go back an hour at 02:00 on 2026-11-01.
+        zone = self.zone("America/New_York")
+        earlier = dt.datetime(2026, 10, 31, 12, 0, tzinfo=zone)
+        later = dt.datetime(2026, 11, 1, 12, 0, tzinfo=zone)
+        self.assertAlmostEqual((later - earlier).total_seconds() / 3600.0, 24.0)
+        self.assertAlmostEqual(deadmans.hours_between(later, earlier), 25.0)
+
+    def test_hours_between_drops_the_skipped_hour(self) -> None:
+        # Clocks in Sydney go forward an hour at 02:00 on 2026-10-04.
+        zone = self.zone("Australia/Sydney")
+        earlier = dt.datetime(2026, 10, 3, 12, 0, tzinfo=zone)
+        later = dt.datetime(2026, 10, 4, 12, 0, tzinfo=zone)
+        self.assertAlmostEqual((later - earlier).total_seconds() / 3600.0, 24.0)
+        self.assertAlmostEqual(deadmans.hours_between(later, earlier), 23.0)
+
+    def test_hours_between_is_plain_across_fixed_offsets(self) -> None:
+        plus_ten = dt.timezone(dt.timedelta(hours=10))
+        earlier = dt.datetime(2026, 1, 15, 0, 0, tzinfo=dt.timezone.utc)
+        later = dt.datetime(2026, 1, 15, 20, 0, tzinfo=plus_ten)
+        self.assertAlmostEqual(deadmans.hours_between(later, earlier), 10.0)
+
+    def test_log_age_across_a_fall_back_change_is_stale(self) -> None:
+        zone = self.zone("America/New_York")
+        write_log(self.log_dir, "scheduled_2026-10-31-1200.log", "OK_SENTINEL\n")
+        now = dt.datetime(2026, 11, 1, 12, 0, tzinfo=zone)
+        result = self.check(self.task(24.5), now)
+        self.assertAlmostEqual(result.age_hours, 25.0, places=3)
+        self.assertEqual(result.state, "STALE")
+
+    def test_log_age_across_a_spring_forward_change_is_fresh(self) -> None:
+        zone = self.zone("Australia/Sydney")
+        write_log(self.log_dir, "scheduled_2026-10-03-1200.log", "OK_SENTINEL\n")
+        now = dt.datetime(2026, 10, 4, 12, 0, tzinfo=zone)
+        result = self.check(self.task(23.5), now)
+        self.assertAlmostEqual(result.age_hours, 23.0, places=3)
+        self.assertEqual(result.state, "FRESH")
+
+    def test_artefact_age_across_a_fall_back_change_is_stale(self) -> None:
+        zone = self.zone("America/New_York")
+        now = dt.datetime(2026, 11, 1, 12, 0, tzinfo=zone)
+        result = self.check(self.ledger_task(24.5, "2026-10-31T12:00:00"), now)
+        self.assertAlmostEqual(result.age_hours, 25.0, places=3)
+        self.assertEqual(result.state, "STALE")
+
+    def test_artefact_age_across_a_spring_forward_change_is_fresh(self) -> None:
+        zone = self.zone("Australia/Sydney")
+        now = dt.datetime(2026, 10, 4, 12, 0, tzinfo=zone)
+        result = self.check(self.ledger_task(23.5, "2026-10-03T12:00:00"), now)
+        self.assertAlmostEqual(result.age_hours, 23.0, places=3)
+        self.assertEqual(result.state, "FRESH")
+
+
 class TestLatestLogAndParseTime(TempDirCase):
     def test_missing_log_dir_returns_none(self) -> None:
         missing = self.tmp_path / "nope"
