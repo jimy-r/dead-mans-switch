@@ -55,6 +55,16 @@ _OFFSET_RE = re.compile(r"^(?P<sign>[+-])(?P<hh>\d{2}):?(?P<mm>\d{2})$")
 # Tolerated in front of the sentinel; the sentinel still has to open the line.
 _SENTINEL_DECORATION = r"[\s*_`]*"
 
+# One ISO 8601 time in front of the sentinel, for a producer that stamps
+# every line it writes ("2026-01-15T09:30:00Z MY_JOB_OK"). Opt-in per task
+# through `line_stamp`. The stamp has to open the line and the sentinel has
+# to follow it, so a mention further along a stamped line still does not
+# count.
+_LINE_STAMP = (
+    r"(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?[ \t]+)?"
+)
+
 # States that mean "this task is not a finding". Everything else -- STALE,
 # FAILED, HUNG, NO_SENTINEL, NEVER_RAN, LOG_UNREADABLE -- fails the check.
 OK_STATES = frozenset({"FRESH", "MANUAL_OK", "RUNNING"})
@@ -72,6 +82,7 @@ EXAMPLE_CONFIG: dict[str, Any] = {
             "failure_patterns": [r"Traceback \(most recent call last\)"],
             "start_sentinel": "NIGHTLY_REPORT_START",
             "max_runtime_hours": 2,
+            "line_stamp": False,
             "manual": False,
         },
         {
@@ -97,6 +108,7 @@ TASK_KEYS = (
     "failure_patterns",
     "start_sentinel",
     "max_runtime_hours",
+    "line_stamp",
     "manual",
     "artefact",
 )
@@ -202,6 +214,7 @@ class Task(NamedTuple):
     max_runtime_hours: float | None = None
     artefact: Artefact | None = None
     failure_patterns: tuple[re.Pattern[str], ...] = ()
+    line_stamp: bool = False
 
 
 class Status(NamedTuple):
@@ -219,14 +232,22 @@ class Config(NamedTuple):
     tzinfo: dt.tzinfo
 
 
-def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
+def compile_log_pattern(
+    pattern: str, task_name: str, *, loose: bool = False
+) -> re.Pattern[str]:
     """Compile a "{task}_{date}-{time}.log" style pattern into a regex for
     one specific task's log filenames.
 
     {task} is substituted with the literal, escaped task name, so the
     resulting regex matches only that task's files. {date} matches
-    YYYY-MM-DD and {time} matches HHMM, both captured by name. Everything
-    else in the pattern -- separators, extension -- is matched literally.
+    YYYY-MM-DD and {time} matches HHMM or HHMMSS, both captured by name.
+    Everything else in the pattern -- separators, extension -- is matched
+    literally.
+
+    With `loose`, {time} matches a digit run of any width. That is the
+    shape of a name this task's producer plausibly wrote, whether or not a
+    run time can be read from it, and latest_log() uses it to tell "no log
+    yet" apart from "logs the checker cannot read".
     """
     if "{date}" not in pattern or "{time}" not in pattern:
         raise ConfigError(
@@ -245,7 +266,9 @@ def compile_log_pattern(pattern: str, task_name: str) -> re.Pattern[str]:
         elif part == "{date}":
             regex_parts.append(r"(?P<date>\d{4}-\d{2}-\d{2})")
         elif part == "{time}":
-            regex_parts.append(r"(?P<time>\d{4})")
+            regex_parts.append(
+                r"(?P<time>\d+)" if loose else r"(?P<time>\d{4}(?:\d{2})?)"
+            )
         else:
             regex_parts.append(re.escape(part))
     return re.compile("^" + "".join(regex_parts) + "$")
@@ -503,6 +526,10 @@ def load_config(path: Path) -> Config:
                 )
             max_runtime_hours = float(max_runtime_hours)
 
+        line_stamp = entry.get("line_stamp", False)
+        if not isinstance(line_stamp, bool):
+            raise ConfigError(f"{path}: task {name!r} line_stamp must be true or false")
+
         raw_artefact = entry.get("artefact")
         artefact = (
             None
@@ -522,25 +549,81 @@ def load_config(path: Path) -> Config:
             max_runtime_hours=max_runtime_hours,
             artefact=artefact,
             failure_patterns=failure_patterns,
+            line_stamp=line_stamp,
         )
 
     return Config(tasks=tasks, log_dir=log_dir, log_pattern=log_pattern, tzinfo=tzinfo)
 
 
-def latest_log(task: str, log_dir: Path, log_pattern: str) -> Path | None:
+# How far ahead of the clock a stamp may sit before it stops counting as
+# evidence of a run. It covers two hosts whose clocks disagree slightly, and
+# it applies to a log filename and to an artefact record alike.
+FUTURE_SKEW_TOLERANCE = dt.timedelta(minutes=5)
+
+
+def _stamp_time(match: re.Match[str], tz: dt.tzinfo) -> dt.datetime | None:
+    """The run time a matched log filename encodes, or None if it has none."""
+    stamp = match.group("time")
+    fmt = "%Y-%m-%d-%H%M%S" if len(stamp) == 6 else "%Y-%m-%d-%H%M"
+    try:
+        return dt.datetime.strptime(f"{match.group('date')}-{stamp}", fmt).replace(
+            tzinfo=tz
+        )
+    except ValueError:
+        # Matched the digit shape (e.g. a filename with month=99) but is not
+        # a real date. Treat as an unknown timestamp rather than crashing the
+        # whole check run over one malformed filename.
+        return None
+
+
+def latest_log(
+    task: str,
+    log_dir: Path,
+    log_pattern: str,
+    tz: dt.tzinfo | None = None,
+    now: dt.datetime | None = None,
+    rejected: list[str] | None = None,
+) -> Path | None:
+    """This task's newest log by the run time in its filename, or None.
+
+    A name only counts if a run time can be read from it and that time is
+    not ahead of the clock. Picking the last name in sort order let one stray
+    file decide the task: "job_2099-12-01-0000.log" gave a negative age and
+    "job_2026-13-01-0000.log" gave none, the staleness test fired on neither,
+    and a dead job read FRESH for as long as that file sat there holding the
+    success line. Names set aside this way, and names whose time is some
+    other width, are appended to `rejected` so the caller can report them.
+    """
     if not log_dir.is_dir():
         return None
+    tz = tz or local_timezone()
+    now = as_aware(now, tz) if now else dt.datetime.now(tz)
     matcher = compile_log_pattern(log_pattern, task)
-    candidates = [
-        entry
-        for entry in log_dir.iterdir()
-        if entry.is_file() and matcher.match(entry.name)
-    ]
+    lookalike = compile_log_pattern(log_pattern, task, loose=True)
+    # The clock as an instant. Two aware datetimes in the same named zone
+    # compare by wall time, which reads a log stamped just before the clocks
+    # go back as most of an hour ahead; subtracting across zones compares the
+    # instants, and cannot overflow on a name stamped in year 9999.
+    now_utc = now.astimezone(dt.timezone.utc)
+    candidates: list[tuple[dt.datetime, str, Path]] = []
+    skipped: list[str] = []
+    for entry in log_dir.iterdir():
+        if not entry.is_file() or not lookalike.match(entry.name):
+            continue
+        match = matcher.match(entry.name)
+        when = _stamp_time(match, tz) if match else None
+        if when is None or when - now_utc > FUTURE_SKEW_TOLERANCE:
+            skipped.append(entry.name)
+            continue
+        candidates.append((when, entry.name, entry))
+    if rejected is not None:
+        rejected.extend(sorted(skipped))
     if not candidates:
         return None
-    # Zero-padded YYYY-MM-DD/HHMM in a fixed position sorts lexicographically
-    # in chronological order, same as the sample this generalises.
-    return max(candidates, key=lambda p: p.name)
+    # By run time, then by name. Sorting on the name alone is chronological
+    # only while {date} leads {time} in the pattern and nothing sorts between
+    # a four-digit and a six-digit time.
+    return max(candidates, key=lambda found: found[:2])[2]
 
 
 def parse_log_time(
@@ -551,18 +634,10 @@ def parse_log_time(
     match = matcher.match(log.name)
     if not match:
         return None
-    try:
-        return dt.datetime.strptime(
-            f"{match.group('date')}-{match.group('time')}", "%Y-%m-%d-%H%M"
-        ).replace(tzinfo=tz or local_timezone())
-    except ValueError:
-        # Matched the digit shape (e.g. a filename with month=99) but is not
-        # a real date. Treat as an unknown timestamp rather than crashing the
-        # whole check run over one malformed filename.
-        return None
+    return _stamp_time(match, tz or local_timezone())
 
 
-def sentinel_matches(sentinel: str, body: str) -> bool:
+def sentinel_matches(sentinel: str, body: str, line_stamp: bool = False) -> bool:
     """True when `sentinel` opens a line of `body`.
 
     A bare ``sentinel in body`` substring test passes a log that merely
@@ -572,14 +647,17 @@ def sentinel_matches(sentinel: str, body: str) -> bool:
     than the false finding it avoids. Anchoring to the start of a line keeps
     the mention out while still accepting the decoration a real sentinel line
     picks up in practice.
+
+    With `line_stamp`, one ISO 8601 time may sit in front of the sentinel.
+    A producer that stamps every line never writes the sentinel at the start
+    of one, so without this its runs read NO_SENTINEL however well they went.
     """
     head = body.lstrip("﻿")  # some producers open the file with a BOM
     # Stop a sentinel matching a longer token that starts with it, but only
     # when it ends in a word character -- \b after "OK!" would never match.
     tail = r"\b" if sentinel[-1:].isalnum() or sentinel.endswith("_") else ""
-    return bool(
-        re.search(rf"^{_SENTINEL_DECORATION}{re.escape(sentinel)}{tail}", head, re.M)
-    )
+    lead = (_LINE_STAMP if line_stamp else "") + _SENTINEL_DECORATION
+    return bool(re.search(rf"^{lead}{re.escape(sentinel)}{tail}", head, re.M))
 
 
 def failure_reason(task: Task, body: str) -> str | None:
@@ -590,7 +668,7 @@ def failure_reason(task: Task, body: str) -> str | None:
     meant to match mid-line starts with `.*`.
     """
     if task.failure_sentinel is not None and sentinel_matches(
-        task.failure_sentinel, body
+        task.failure_sentinel, body, task.line_stamp
     ):
         return "failure sentinel present"
     if task.failure_patterns:
@@ -604,10 +682,9 @@ def failure_reason(task: Task, body: str) -> str | None:
 # Artefact overrides the log only when it postdates that run's END by more
 # than this margin: a record the SAME run emits partway through must not
 # outrank that run's own FAILED or HUNG verdict. A record stamped
-# further ahead of the clock than the skew tolerance is never treated as
+# further ahead of the clock than FUTURE_SKEW_TOLERANCE is never treated as
 # evidence of a run that has not happened yet.
 ARTEFACT_OVERRIDE_MARGIN = dt.timedelta(minutes=10)
-FUTURE_SKEW_TOLERANCE = dt.timedelta(minutes=5)
 
 
 def _logged_run_end(
@@ -631,7 +708,8 @@ def _logged_run_end(
     if log_time is not None and (end is None or end < log_time):
         end = log_time
     finished = (
-        sentinel_matches(task.sentinel, body) or failure_reason(task, body) is not None
+        sentinel_matches(task.sentinel, body, task.line_stamp)
+        or failure_reason(task, body) is not None
     )
     if not finished and task.max_runtime_hours is not None and log_time is not None:
         end = max(end, log_time + dt.timedelta(hours=task.max_runtime_hours))
@@ -652,7 +730,19 @@ def check_task(
     now = as_aware(now, tz) if now else dt.datetime.now(tz)
 
     skewed: list[dt.datetime] = []
-    status = _check_task(task, log_dir, log_pattern, now, tz, skewed)
+    rejected: list[str] = []
+    status = _check_task(task, log_dir, log_pattern, now, tz, skewed, rejected)
+    if rejected:
+        # Say which names were set aside. A stray file is cheap to delete once
+        # someone knows it is there, and a whole directory of them usually
+        # means the producer and the config disagree about the clock.
+        more = f" and {len(rejected) - 3} more" if len(rejected) > 3 else ""
+        status = status._replace(
+            detail=(
+                f"{status.detail}; skipped {len(rejected)} log name(s) with no "
+                f"usable run time: {', '.join(rejected[:3])}{more}"
+            )
+        )
     if skewed:
         status = status._replace(
             detail=(
@@ -670,6 +760,7 @@ def _check_task(
     now: dt.datetime,
     tz: dt.tzinfo,
     skewed: list[dt.datetime],
+    rejected: list[str],
 ) -> Status:
     artefact_time = (
         latest_artefact_time(
@@ -695,10 +786,18 @@ def _check_task(
             task.name, "FRESH", when, age, f"{label} updated {age:.1f}h ago; {note}"
         )
 
-    log = latest_log(task.name, log_dir, log_pattern)
+    log = latest_log(task.name, log_dir, log_pattern, tz, now, rejected)
     if log is None:
         if artefact_time is not None:
-            return from_artefact(artefact_time, "no log file matches pattern")
+            return from_artefact(
+                artefact_time,
+                "no readable log file" if rejected else "no log file matches pattern",
+            )
+        if rejected:
+            # The task has logs, but none gives a run time the checker can
+            # trust, so "no log yet" would be false. On a manual task it would
+            # stay false for good, because MANUAL_OK never goes stale.
+            return Status(task.name, "LOG_UNREADABLE", None, None, "no readable log")
         if task.manual:
             return Status(task.name, "MANUAL_OK", None, None, "manual task; no log yet")
         return Status(task.name, "NEVER_RAN", None, None, "no log file matches pattern")
@@ -725,7 +824,7 @@ def _check_task(
                 artefact_time, f"newer than the last logged run, which ended {ended}"
             )
 
-    success = sentinel_matches(task.sentinel, body)
+    success = sentinel_matches(task.sentinel, body, task.line_stamp)
     failure = failure_reason(task, body)
 
     # Staleness is checked first and short-circuits: a log old enough to
@@ -756,7 +855,7 @@ def _check_task(
     if (
         not success
         and task.start_sentinel
-        and sentinel_matches(task.start_sentinel, body)
+        and sentinel_matches(task.start_sentinel, body, task.line_stamp)
     ):
         grace = task.max_runtime_hours
         if grace is not None and age_hours is not None and age_hours <= grace:
@@ -890,9 +989,10 @@ def cmd_selftest() -> int:
 
         # Each scenario gets its own task name so its log file cannot be
         # shadowed by a more-recent log left behind by an earlier scenario
-        # in this same throwaway log_dir (latest-by-filename wins, same as
-        # latest_log() everywhere else -- see test_picks_most_recent_by_filename
-        # in test_deadmans.py for the behaviour this relies on).
+        # in this same throwaway log_dir (the newest run time in a filename
+        # wins, same as latest_log() everywhere else -- see
+        # test_picks_most_recent_by_filename in test_deadmans.py for the
+        # behaviour this relies on).
         def scenario(name: str) -> Task:
             return Task(name, 24.0, "OK_SENTINEL", "FAIL_SENTINEL", False)
 
@@ -973,6 +1073,49 @@ def cmd_selftest() -> int:
             "manual, no log",
             Task("manual-task", 24.0, "OK_SENTINEL", None, True),
             "MANUAL_OK",
+        )
+
+        # A stray name that sorts last must not stand in for the newest run.
+        write_log("stray-case", now - dt.timedelta(hours=48), "hello\nOK_SENTINEL\n")
+        for stray in (
+            "stray-case_2099-12-01-0000.log",
+            "stray-case_2026-13-01-0000.log",
+        ):
+            (log_dir / stray).write_text("OK_SENTINEL\n", encoding="utf-8")
+        expect(
+            "a future or impossible log name beside a stale run",
+            scenario("stray-case"),
+            "STALE",
+        )
+
+        (log_dir / "odd-width-case_2026-01-15-09301.log").write_text(
+            "OK_SENTINEL\n", encoding="utf-8"
+        )
+        expect(
+            "manual, with a log name no run time can be read from",
+            Task("odd-width-case", 24.0, "OK_SENTINEL", None, True),
+            "LOG_UNREADABLE",
+        )
+
+        (log_dir / "seconds-case_2026-01-15-100000.log").write_text(
+            "OK_SENTINEL\n", encoding="utf-8"
+        )
+        expect("a six-digit time in the log name", scenario("seconds-case"), "FRESH")
+
+        write_log(
+            "stamped-case",
+            now - dt.timedelta(hours=2),
+            "2026-01-15T10:00:00Z OK_SENTINEL\n",
+        )
+        expect(
+            "a line stamp in front of the sentinel, without line_stamp",
+            scenario("stamped-case"),
+            "NO_SENTINEL",
+        )
+        expect(
+            "a line stamp in front of the sentinel, with line_stamp",
+            scenario("stamped-case")._replace(line_stamp=True),
+            "FRESH",
         )
 
     if failures:
