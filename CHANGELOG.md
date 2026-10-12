@@ -14,6 +14,7 @@ A task that passed on a log name the checker should not have trusted can report 
 
 - One stray log name can no longer hold a dead job at `FRESH`. The checker took the last matching filename in sort order, so a name stamped in the future, or one with a date that does not exist, was read as the newest run. Its age came out negative or missing, so the staleness test never fired, and the success line inside it passed the task while every real log went unread. A name now counts only when its stamp is a real time no more than five minutes ahead of the clock, and the newest log is chosen by that time. Each skipped name is listed in the task's detail line.
 - A task whose log names were all skipped reports `LOG_UNREADABLE`. Before, it reported `NEVER_RAN`, or `MANUAL_OK` on a manual task, which never goes stale.
+- An age measured across a daylight-saving change is no longer an hour out. With `timezone` set to a named zone, the checker subtracted two readings of that zone's wall clock, so noon to noon read 24 hours on the night the clocks went back, where 25 had passed, and 24 on the night they went forward, where 23 had. A job could stay `FRESH` an hour past its window, or turn `STALE` an hour early. Ages are now taken in UTC. `local`, `UTC` and fixed offsets were never affected.
 - `{time}` in `log_pattern` accepts `HHMMSS` as well as `HHMM`. A producer that stamps seconds into its log names used to match nothing, with the same `MANUAL_OK` result.
 
 ### Changed
