@@ -1375,6 +1375,15 @@ class TestLogNameGuards(TempDirCase):
         self.assertEqual(result.state, "MANUAL_OK")
         self.assertEqual(result.detail, "manual task; no log yet")
 
+    def test_manual_task_log_read_error_is_log_unreadable(self) -> None:
+        write_log(self.log_dir, "scheduled_2026-01-15-1000.log", "OK_SENTINEL\n")
+        with mock.patch.object(
+            Path, "read_text", side_effect=OSError("permission denied")
+        ):
+            result = self.check(self.task._replace(manual=True))
+        self.assertEqual(result.state, "LOG_UNREADABLE")
+        self.assertIn("permission denied", result.detail)
+
     def test_log_unreadable_is_a_finding(self) -> None:
         self.assertNotIn("LOG_UNREADABLE", deadmans.OK_STATES)
 
