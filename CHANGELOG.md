@@ -2,7 +2,7 @@
 
 Notable changes to `dead-mans-switch`, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.3.1] - unreleased
+## [0.3.1] - 2026-10-25
 
 A task that passed on a log name the checker should not have trusted can report a finding after this upgrade. Run `check` once and read the detail lines.
 
